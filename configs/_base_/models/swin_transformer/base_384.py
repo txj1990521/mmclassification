@@ -4,7 +4,7 @@ model = dict(
     type='ImageClassifier',
     backbone=dict(
         type='SwinTransformer',
-        arch='base',
+        arch='_base_',
         img_size=384,
         stage_cfgs=dict(block_cfgs=dict(window_size=12))),
     neck=dict(type='GlobalAveragePooling'),

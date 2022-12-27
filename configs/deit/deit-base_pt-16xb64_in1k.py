@@ -3,7 +3,7 @@ _base_ = './deit-small_pt-4xb256_in1k.py'
 # model settings
 model = dict(
     backbone=dict(
-        type='VisionTransformer', arch='deit-base', drop_path_rate=0.1),
+        type='VisionTransformer', arch='deit-_base_', drop_path_rate=0.1),
     head=dict(type='VisionTransformerClsHead', in_channels=768),
 )
 

@@ -1,7 +1,7 @@
 # model settings
 model = dict(
     type='ImageClassifier',
-    backbone=dict(type='HorNet', arch='base', drop_path_rate=0.5),
+    backbone=dict(type='HorNet', arch='_base_', drop_path_rate=0.5),
     head=dict(
         type='LinearClsHead',
         num_classes=1000,

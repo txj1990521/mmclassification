@@ -15,9 +15,9 @@ Collections:
       Version: v0.18.0
 
 Models:
-  - Name: mlp-mixer-base-p16_3rdparty_64xb64_in1k
+  - Name: mlp-mixer-_base_-p16_3rdparty_64xb64_in1k
     In Collection: MLP-Mixer
-    Config: configs/mlp_mixer/mlp-mixer-base-p16_64xb64_in1k.py
+    Config: configs/mlp_mixer/mlp-mixer-_base_-p16_64xb64_in1k.py
     Metadata:
       FLOPs: 12610000000  # 12.61 G
       Parameters: 59880000  # 59.88 M

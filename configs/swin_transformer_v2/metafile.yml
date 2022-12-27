@@ -80,7 +80,7 @@ Models:
     Converted From:
       Weights: https://github.com/SwinTransformer/storage/releases/download/v2.0.0/swinv2_small_patch4_window16_256.pth
       Code: https://github.com/microsoft/Swin-Transformer
-  - Name: swinv2-base-w8_3rdparty_in1k-256px
+  - Name: swinv2-_base_-w8_3rdparty_in1k-256px
     Metadata:
       FLOPs: 14990000000
       Parameters: 87920000
@@ -92,11 +92,11 @@ Models:
           Top 5 Accuracy: 96.86
         Task: Image Classification
     Weights: https://download.openmmlab.com/mmclassification/v0/swin-v2/swinv2-base-w8_3rdparty_in1k-256px_20220803-8ff28f2b.pth
-    Config: configs/swin_transformer_v2/swinv2-base-w8_16xb64_in1k-256px.py
+    Config: configs/swin_transformer_v2/swinv2-_base_-w8_16xb64_in1k-256px.py
     Converted From:
       Weights: https://github.com/SwinTransformer/storage/releases/download/v2.0.0/swinv2_base_patch4_window8_256.pth
       Code: https://github.com/microsoft/Swin-Transformer
-  - Name: swinv2-base-w16_3rdparty_in1k-256px
+  - Name: swinv2-_base_-w16_3rdparty_in1k-256px
     Metadata:
       FLOPs: 15140000000
       Parameters: 87920000
@@ -108,11 +108,11 @@ Models:
           Top 5 Accuracy: 97.05
         Task: Image Classification
     Weights: https://download.openmmlab.com/mmclassification/v0/swin-v2/swinv2-base-w16_3rdparty_in1k-256px_20220803-5a1886b7.pth
-    Config: configs/swin_transformer_v2/swinv2-base-w16_16xb64_in1k-256px.py
+    Config: configs/swin_transformer_v2/swinv2-_base_-w16_16xb64_in1k-256px.py
     Converted From:
       Weights: https://github.com/SwinTransformer/storage/releases/download/v2.0.0/swinv2_base_patch4_window16_256.pth
       Code: https://github.com/microsoft/Swin-Transformer
-  - Name: swinv2-base-w16_in21k-pre_3rdparty_in1k-256px
+  - Name: swinv2-_base_-w16_in21k-pre_3rdparty_in1k-256px
     Metadata:
       Training Data: ImageNet-21k
       FLOPs: 15140000000
@@ -125,11 +125,11 @@ Models:
           Top 5 Accuracy: 97.88
         Task: Image Classification
     Weights: https://download.openmmlab.com/mmclassification/v0/swin-v2/swinv2-base-w16_in21k-pre_3rdparty_in1k-256px_20220803-8d7aa8ad.pth
-    Config: configs/swin_transformer_v2/swinv2-base-w16_in21k-pre_16xb64_in1k-256px.py
+    Config: configs/swin_transformer_v2/swinv2-_base_-w16_in21k-pre_16xb64_in1k-256px.py
     Converted From:
       Weights: https://github.com/SwinTransformer/storage/releases/download/v2.0.0/swinv2_base_patch4_window12to16_192to256_22kto1k_ft.pth
       Code: https://github.com/microsoft/Swin-Transformer
-  - Name: swinv2-base-w24_in21k-pre_3rdparty_in1k-384px
+  - Name: swinv2-_base_-w24_in21k-pre_3rdparty_in1k-384px
     Metadata:
       Training Data: ImageNet-21k
       FLOPs: 34070000000
@@ -142,7 +142,7 @@ Models:
           Top 5 Accuracy: 98.23
         Task: Image Classification
     Weights: https://download.openmmlab.com/mmclassification/v0/swin-v2/swinv2-base-w24_in21k-pre_3rdparty_in1k-384px_20220803-44eb70f8.pth
-    Config: configs/swin_transformer_v2/swinv2-base-w24_in21k-pre_16xb64_in1k-384px.py
+    Config: configs/swin_transformer_v2/swinv2-_base_-w24_in21k-pre_16xb64_in1k-384px.py
     Converted From:
       Weights: https://github.com/SwinTransformer/storage/releases/download/v2.0.0/swinv2_base_patch4_window12to24_192to384_22kto1k_ft.pth
       Code: https://github.com/microsoft/Swin-Transformer
@@ -180,7 +180,7 @@ Models:
     Converted From:
       Weights: https://github.com/SwinTransformer/storage/releases/download/v2.0.0/swinv2_large_patch4_window12to24_192to384_22kto1k_ft.pth
       Code: https://github.com/microsoft/Swin-Transformer
-  - Name: swinv2-base-w12_3rdparty_in21k-192px
+  - Name: swinv2-_base_-w12_3rdparty_in21k-192px
     Metadata:
       Training Data: ImageNet-21k
       FLOPs: 8510000000

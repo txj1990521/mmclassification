@@ -1,6 +1,6 @@
 model = dict(
     type='ImageClassifier',
-    backbone=dict(type='MViT', arch='base', drop_path_rate=0.3),
+    backbone=dict(type='MViT', arch='_base_', drop_path_rate=0.3),
     neck=dict(type='GlobalAveragePooling'),
     head=dict(
         type='LinearClsHead',

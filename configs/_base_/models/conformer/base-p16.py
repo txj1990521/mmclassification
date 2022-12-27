@@ -2,7 +2,7 @@
 model = dict(
     type='ImageClassifier',
     backbone=dict(
-        type='Conformer', arch='base', drop_path_rate=0.1, init_cfg=None),
+        type='Conformer', arch='_base_', drop_path_rate=0.1, init_cfg=None),
     neck=None,
     head=dict(
         type='ConformerHead',

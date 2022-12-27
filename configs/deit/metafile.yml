@@ -103,7 +103,7 @@ Models:
       Weights: https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth
       Code: https://github.com/facebookresearch/deit/blob/f5123946205daf72a88783dae94cabff98c49c55/models.py#L93
     Config: configs/deit/deit-base_pt-16xb64_in1k.py
-  - Name: deit-base-distilled_3rdparty_pt-16xb64_in1k
+  - Name: deit-_base_-distilled_3rdparty_pt-16xb64_in1k
     Metadata:
       FLOPs: 16860000000
       Parameters: 86570000
@@ -118,7 +118,7 @@ Models:
     Converted From:
       Weights: https://dl.fbaipublicfiles.com/deit/deit_base_distilled_patch16_224-df68dfff.pth
       Code: https://github.com/facebookresearch/deit/blob/f5123946205daf72a88783dae94cabff98c49c55/models.py#L138
-    Config: configs/deit/deit-base-distilled_pt-16xb64_in1k.py
+    Config: configs/deit/deit-_base_-distilled_pt-16xb64_in1k.py
   - Name: deit-base_3rdparty_ft-16xb32_in1k-384px
     Metadata:
       FLOPs: 49370000000
@@ -135,7 +135,7 @@ Models:
       Weights: https://dl.fbaipublicfiles.com/deit/deit_base_patch16_384-8de9b5d1.pth
       Code: https://github.com/facebookresearch/deit/blob/f5123946205daf72a88783dae94cabff98c49c55/models.py#L153
     Config: configs/deit/deit-base_ft-16xb32_in1k-384px.py
-  - Name: deit-base-distilled_3rdparty_ft-16xb32_in1k-384px
+  - Name: deit-_base_-distilled_3rdparty_ft-16xb32_in1k-384px
     Metadata:
       FLOPs: 49370000000
       Parameters: 86860000
@@ -150,4 +150,4 @@ Models:
     Converted From:
       Weights: https://dl.fbaipublicfiles.com/deit/deit_base_distilled_patch16_384-d0272ac0.pth
       Code: https://github.com/facebookresearch/deit/blob/f5123946205daf72a88783dae94cabff98c49c55/models.py#L168
-    Config: configs/deit/deit-base-distilled_ft-16xb32_in1k-384px.py
+    Config: configs/deit/deit-_base_-distilled_ft-16xb32_in1k-384px.py

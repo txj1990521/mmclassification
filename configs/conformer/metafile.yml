@@ -60,9 +60,9 @@ Models:
           Top 5 Accuracy: 96.02
         Task: Image Classification
     Weights: https://download.openmmlab.com/mmclassification/v0/conformer/conformer-small-p32_8xb128_in1k_20211206-947a0816.pth
-  - Name: conformer-base-p16_3rdparty_8xb128_in1k
+  - Name: conformer-_base_-p16_3rdparty_8xb128_in1k
     In Collection: Conformer
-    Config: configs/conformer/conformer-base-p16_8xb128_in1k.py
+    Config: configs/conformer/conformer-_base_-p16_8xb128_in1k.py
     Metadata:
       FLOPs: 22892078080
       Parameters: 83289136

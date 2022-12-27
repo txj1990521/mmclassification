@@ -9,7 +9,7 @@ model = dict(
     type='ImageClassifier',
     backbone=dict(
         type='VisionTransformer',
-        arch='deit-base',
+        arch='deit-_base_',
         img_size=384,
         patch_size=16,
     ),

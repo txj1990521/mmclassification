@@ -5,12 +5,21 @@ import mmcv
 
 from mmcls.apis import inference_model, init_model, show_result_pyplot
 
+dataset_path = f'D:/data/MNIST/mnista_data/val/0/0.1.jpg'
+# dataset_path = f'/data/txj/Train/test.jpg'
+file_root = dataset_path  # 当前文件夹下的所有图片
+Run_config = "configs/mobilenet_v3/mobilenet-v3-small_8xb16_数字.py"
+class_checkpoint = 'work_dirs/mobilenet-v3-small_8xb16_数字/epoch_200.pth'
+
+
 
 def main():
+    global Run_config, class_checkpoint,file_root
     parser = ArgumentParser()
-    parser.add_argument('img', help='Image file')
-    parser.add_argument('config', help='Config file')
-    parser.add_argument('checkpoint', help='Checkpoint file')
+    parser.add_argument('--img', type=str,
+                        default=file_root, help='Image file')
+    parser.add_argument('--config', type=str, default=Run_config, help='Config file')
+    parser.add_argument('--checkpoint', type=str, default=class_checkpoint, help='Checkpoint file')
     parser.add_argument(
         '--show',
         action='store_true',

@@ -1,6 +1,6 @@
 _base_ = [
     '../_base_/models/mobilenet_v3_small_cifar.py',
-    '../_base_/datasets/数字测试datasets.py',
+    '../_base_/datasets/base_side_datasets.py',
     '../_base_/schedules/cifar10_bs128_数字测试.py',
     '../_base_/default_runtime.py'
 ]

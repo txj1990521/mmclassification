@@ -1,3 +1,5 @@
+custom_imports = dict(
+    imports=['mmcls.datasets.mydataset', 'side_ai.pipelines.init_pipelines'], allow_failed_imports=True)
 dataset_type = 'MyDataset'
 classes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']  # The category names of your dataset
 
@@ -21,26 +23,40 @@ test_pipeline = [
     dict(type='ImageToTensor', keys=['img']),
     dict(type='Collect', keys=['img'])
 ]
+train_init_pipeline = [
+    dict(type='CopyData2Local', target_dir='/home/txj/data/公共数据缓存', run_rsync=True),
+    dict(type='LoadCategoryList', ignore_labels=['屏蔽']),
+    dict(type='LoadPathList'),
+    dict(type='SplitData', start=0, end=0.8, key='json_path_list'),
+    dict(type='StatCategoryCounter'),
+    dict(type='CopyData', times=1),
+    dict(type='generate_mmcls_ann'),
+]
 
+test_init_pipeline = [
+    dict(type='CopyData2Local', target_dir='/home/txj/data/公共数据缓存', run_rsync=True),
+    dict(type='LoadCategoryList', ignore_labels=['屏蔽']),
+    dict(type='LoadPathList'),
+    dict(type='SplitData', start=0, end=0.8, key='json_path_list'),
+    dict(type='StatCategoryCounter'),
+    dict(type='CopyData', times=1),
+]
 data = dict(
     train=dict(
+        init_pipeline=train_init_pipeline,
         type=dataset_type,
-        data_prefix='D:/data/MNIST/mnista_data/train',
-        ann_file='D:/data/MNIST/mnista_data/meta/train.txt',
         classes=classes,
         pipeline=train_pipeline
     ),
     val=dict(
+        init_pipeline=test_init_pipeline,
         type=dataset_type,
-        data_prefix='D:/data/MNIST/mnista_data/val',
-        ann_file='D:/data/MNIST/mnista_data/meta/val.txt',
         classes=classes,
         pipeline=test_pipeline
     ),
     test=dict(
+        init_pipeline=test_init_pipeline,
         type=dataset_type,
-        data_prefix='D:/data/MNIST/mnista_data/test',
-        ann_file='D:/data/MNIST/mnista_data/meta/test.txt',
         classes=classes,
         pipeline=test_pipeline
     )
