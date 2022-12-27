@@ -30,7 +30,7 @@ train_init_pipeline = [
     dict(type='SplitData', start=0, end=0.8, key='json_path_list'),
     dict(type='StatCategoryCounter'),
     dict(type='CopyData', times=1),
-    dict(type='generate_mmcls_ann'),
+    dict(type='GenerateMmclsAnn'),
 ]
 
 test_init_pipeline = [

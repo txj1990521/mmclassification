@@ -629,8 +629,7 @@ class CopyData2Local:
                 logger.info(cmd)
                 self.rsync(cmd, self.run_rsync)
                 dataset_path_list.append(str(Path(target_dir + x)))
-            if torch.distributed.is_available(
-            ) and torch.distributed.is_initialized():
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
             logger.info(
                 f'数据已经缓存到了{target_dir}，dataset_path_list = {dataset_path_list}'
@@ -750,7 +749,7 @@ class GenerateMmclsAnn:
         data_dir = results['data_dir']
         img_type = results['img_type']
         data_dir = str(Path(data_dir)) + '/'
-        classes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+        classes = results['classes']
         class2id = dict(zip(classes, range(len(classes))))
         data_dir = str(Path(data_dir)) + '/'
         dir_types = ['train', 'val', 'test']
