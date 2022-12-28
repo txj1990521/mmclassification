@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 custom_imports = dict(
     imports=['mmcls.datasets.mydataset', 'side_ai.pipelines.init_pipelines'], allow_failed_imports=True)
 dataset_type = 'MyDataset'
@@ -29,7 +30,6 @@ train_init_pipeline = [
     dict(type='LoadPathList'),
     dict(type='SplitData', start=0, end=0.8, key='json_path_list'),
     dict(type='StatCategoryCounter'),
-    dict(type='CopyData', times=1),
     dict(type='GenerateMmclsAnn'),
 ]
 
@@ -39,7 +39,7 @@ test_init_pipeline = [
     dict(type='LoadPathList'),
     dict(type='SplitData', start=0, end=0.8, key='json_path_list'),
     dict(type='StatCategoryCounter'),
-    dict(type='CopyData', times=1),
+    dict(type='GenerateMmclsAnn'),
 ]
 data = dict(
     train=dict(

@@ -7,7 +7,7 @@ import numpy as np
 # from mmcls.datasets.pipelines.__init__ import Compose
 from mmdet.datasets.pipelines import Compose
 
-
+# -*- coding: utf-8 -*-
 def expanduser(path):
     if isinstance(path, (str, PathLike)):
         return osp.expanduser(path)

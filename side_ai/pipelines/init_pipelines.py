@@ -20,19 +20,16 @@ from tqdm import tqdm
 from mmdet.datasets.builder import PIPELINES
 from mmdet.utils import get_root_logger
 from side_ai.pipelines.utils_labelme import copy_json_and_img, shape_to_points, _annotation
-
+# -*- coding: utf-8 -*-
 '''
 主要是操作数据
 '''
-
-
 @PIPELINES.register_module()
 # 将lablelme的keypoint数据转化为coco数据格式
 class Labelme2COCOKeypoints:
 
-    def __init__(self, bbox_full_image=False,*args, **kwargs):
+    def __init__(self, bbox_full_image=False, *args, **kwargs):
         self.bbox_full_image = bbox_full_image
-
 
     def __call__(self, results, *args, **kwargs):
         category_list = results['category_list']
@@ -189,6 +186,7 @@ class LoadCategoryList:
         return repr_str
 
 
+# 加载图像数据路径
 @PIPELINES.register_module()
 class LoadPathList:
 
@@ -327,20 +325,22 @@ class StatCategoryCounter:
     def __call__(self, results, *args, **kwargs):
         category_map = results['category_map']
         category_list = results['category_list']
-        json_data_list = results['json_data_list']
+        if len(results['json_path_list']) != 0:
+            json_data_list = results['json_data_list']
+            category_counter = Counter(
+                category_map.get(y['label'], y['label']) for x in json_data_list
+                for y in x['shapes'])
+        else:
+            category_counter =Counter(category_map.get(x.split('/')[-2], x.split('/')[-2]) for x in results['path_set'])
 
         logger = get_root_logger()
         logger.propagate = False
         logger.info(f"\n映射表为{category_map}\n列表为{category_list}")
 
-        category_counter = Counter(
-            category_map.get(y['label'], y['label']) for x in json_data_list
-            for y in x['shapes'])
         s = '\n'
         for k, v in category_counter.most_common():
             s += f'{k}\t{v}\n'
         logger.info(f'统计类别分布{s}')
-
         results['category_counter'] = category_counter
         return results
 
@@ -629,8 +629,15 @@ class CopyData2Local:
                 logger.info(cmd)
                 self.rsync(cmd, self.run_rsync)
                 dataset_path_list.append(str(Path(target_dir + x)))
+            # torch.distributed.is_available()
+            # 如果分布式包可以获得的话就返回True。否则，torch.distributed对任何API都是不可见的。
+            # 目前，torch.distributed在Linux和MacOS上都可以得到。设置USE_DISTRIBUTED=1来启动它，当从源中构建PyTorch时。
+            # 目前，对Linux系统，默认值是USE_DISTRIBUTED=1，对MacOS系统，默认值是USE_DISTRIBUTED=0。
+            # torch.distributed.is_initialized()[source]
+            # 检查默认的进程数是否已经被初始化
+
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                torch.distributed.barrier()  # 对所有进程进行同步
             logger.info(
                 f'数据已经缓存到了{target_dir}，dataset_path_list = {dataset_path_list}'
             )
@@ -746,10 +753,9 @@ class CopyErrorPath:
 @PIPELINES.register_module()
 class GenerateMmclsAnn:
     def __call__(self, results, *args, **kwargs):
-        data_dir = results['data_dir']
-        img_type = results['img_type']
+        data_dir = results['dataset_path_list'][0]
         data_dir = str(Path(data_dir)) + '/'
-        classes = results['classes']
+        classes = results['category_list']
         class2id = dict(zip(classes, range(len(classes))))
         data_dir = str(Path(data_dir)) + '/'
         dir_types = ['train', 'val', 'test']
@@ -764,7 +770,7 @@ class GenerateMmclsAnn:
             target_dir = data_dir + sd + '/'
             for d in os.listdir(target_dir):
                 class_id = str(class2id[d])
-                images = glob(target_dir + d + '/*' + img_type)
+                images = glob(target_dir + d + '/*' + 'img_type')
                 for img in images:
                     img = d + '/' + os.path.basename(img)
                     annotations.append(img + ' ' + class_id + '\n')
