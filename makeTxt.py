@@ -23,7 +23,7 @@ def generate_mmcls_ann(data_dir, img_type='.png'):
             images = glob(target_dir + d + '/*' + img_type)
             for img in images:
                 img = d + '/' + os.path.basename(img)
-                annotations.append(img + ' ' + class_id + '\n')
+                annotations.append(img + ' ' + class_id + '\n') 
         annotations[-1] = annotations[-1].strip()
         with open(ann_dir + sd + '.txt', 'w') as f:
             f.writelines(annotations)

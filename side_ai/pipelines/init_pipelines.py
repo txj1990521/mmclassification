@@ -758,12 +758,14 @@ class CopyErrorPath:
 class GenerateMmclsAnn:
     def __call__(self, results, *args, **kwargs):
         data_dir = results['dataset_path_list'][0]
-        data_dir = str(Path(data_dir)) + '/'
+        up_path = os.path.dirname(os.path.realpath(data_dir))
+        data_dir = str(Path(up_path)) + '/'
         classes = results['category_list']
         class2id = dict(zip(classes, range(len(classes))))
         dir_types = ['train', 'val', 'test']
         sub_dirs = os.listdir(data_dir)
-        sub_dirs.remove([x for x in sub_dirs if x.endswith('ini')][0])
+        for y in [x for x in sub_dirs if x.endswith('ini') or 'meta' in x]:
+            sub_dirs.remove(y)
         image_path = results['path_set']
 
         ann_dir = data_dir + 'meta/'
@@ -784,6 +786,10 @@ class GenerateMmclsAnn:
             annotations[-1] = annotations[-1].strip()
             with open(ann_dir + sd + '.txt', 'w') as f:
                 f.writelines(annotations)
+        results['classification_ann_path'] = ann_dir + sd + '.txt'
+        results['classification_ann'] = annotations
+
+        return results
 
     def __repr__(self):
         repr_str = self.__class__.__name__
