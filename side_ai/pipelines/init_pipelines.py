@@ -757,9 +757,10 @@ class GenerateMmclsAnn:
         data_dir = str(Path(data_dir)) + '/'
         classes = results['category_list']
         class2id = dict(zip(classes, range(len(classes))))
-        data_dir = str(Path(data_dir)) + '/'
         dir_types = ['train', 'val', 'test']
         sub_dirs = os.listdir(data_dir)
+        sub_dirs.remove([x for x in sub_dirs if x.endswith('ini')][0])
+
         ann_dir = data_dir + 'meta/'
         if not os.path.exists(ann_dir):
             os.makedirs(ann_dir)

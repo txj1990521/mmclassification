@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 custom_imports = dict(
-    imports=['mmcls.datasets.mydataset', 'side_ai.pipelines.init_pipelines'], allow_failed_imports=True)
-dataset_type = 'MyDataset'
+    imports=['config2._base_.datasets.class_dataset', 'side_ai.pipelines.init_pipelines'], allow_failed_imports=True)
+dataset_type = 'ClassDataset'
 classes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']  # The category names of your dataset
 
 img_norm_cfg = dict(

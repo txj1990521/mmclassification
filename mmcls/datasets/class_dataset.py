@@ -14,7 +14,7 @@ def expanduser(path):
     else:
         return path
 @DATASETS.register_module()
-class MyDataset(BaseDataset):
+class ClassDataset(BaseDataset):
     CLASSES = None
     def __init__(self,
                  dataset_path_list,  # 数据集路径 string，list
