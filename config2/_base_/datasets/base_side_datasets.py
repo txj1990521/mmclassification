@@ -28,7 +28,6 @@ train_init_pipeline = [
     dict(type='CopyData2Local', target_dir='/home/txj/data/公共数据缓存', run_rsync=True),
     dict(type='LoadCategoryList', ignore_labels=['屏蔽']),
     dict(type='LoadPathList'),
-    dict(type='SplitData', start=0, end=0.8, key='json_path_list'),
     dict(type='StatCategoryCounter'),
     dict(type='GenerateMmclsAnn'),
 ]
@@ -37,7 +36,7 @@ test_init_pipeline = [
     dict(type='CopyData2Local', target_dir='/home/txj/data/公共数据缓存', run_rsync=True),
     dict(type='LoadCategoryList', ignore_labels=['屏蔽']),
     dict(type='LoadPathList'),
-    dict(type='SplitData', start=0, end=0.8, key='json_path_list'),
+    dict(type='SplitData', start=0, end=0.8, key='path_set'),
     dict(type='StatCategoryCounter'),
     dict(type='GenerateMmclsAnn'),
 ]

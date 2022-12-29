@@ -5,7 +5,7 @@ import os.path as osp
 from os import PathLike
 import numpy as np
 # from mmcls.datasets.pipelines.__init__ import Compose
-from mmdet.datasets.pipelines import Compose
+from mmcls.datasets.pipelines import Compose
 
 # -*- coding: utf-8 -*-
 def expanduser(path):

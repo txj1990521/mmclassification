@@ -17,13 +17,16 @@ import torch.distributed
 from mmcv.runner.dist_utils import master_only
 from torch import distributed as dist
 from tqdm import tqdm
-from mmdet.datasets.builder import PIPELINES
+from mmcls.datasets.builder import PIPELINES
 from mmdet.utils import get_root_logger
 from side_ai.pipelines.utils_labelme import copy_json_and_img, shape_to_points, _annotation
+
 # -*- coding: utf-8 -*-
 '''
 主要是操作数据
 '''
+
+
 @PIPELINES.register_module()
 # 将lablelme的keypoint数据转化为coco数据格式
 class Labelme2COCOKeypoints:
@@ -331,7 +334,8 @@ class StatCategoryCounter:
                 category_map.get(y['label'], y['label']) for x in json_data_list
                 for y in x['shapes'])
         else:
-            category_counter =Counter(category_map.get(x.split('/')[-2], x.split('/')[-2]) for x in results['path_set'])
+            category_counter = Counter(
+                category_map.get(x.split('/')[-2], x.split('/')[-2]) for x in results['path_set'])
 
         logger = get_root_logger()
         logger.propagate = False
@@ -760,6 +764,7 @@ class GenerateMmclsAnn:
         dir_types = ['train', 'val', 'test']
         sub_dirs = os.listdir(data_dir)
         sub_dirs.remove([x for x in sub_dirs if x.endswith('ini')][0])
+        image_path = results['path_set']
 
         ann_dir = data_dir + 'meta/'
         if not os.path.exists(ann_dir):
@@ -771,7 +776,8 @@ class GenerateMmclsAnn:
             target_dir = data_dir + sd + '/'
             for d in os.listdir(target_dir):
                 class_id = str(class2id[d])
-                images = glob(target_dir + d + '/*' + 'img_type')
+                images = [x for x in image_path if d in x]
+                # images = glob(target_dir + d + '/*' + 'img_type')
                 for img in images:
                     img = d + '/' + os.path.basename(img)
                     annotations.append(img + ' ' + class_id + '\n')

@@ -4,7 +4,7 @@ _base_ = [
     '/home/txj/mmclassification/configs/_base_/schedules/cifar10_bs128_数字测试.py',
     '/home/txj/mmclassification/configs/_base_/default_runtime.py'
 ]
-dataset_path = '/home/txj/data/side_data/十分区分类数据'
+dataset_path = '/mnt/AIData/txj/data/十分区数据/'
 dataset_path_list = [f'{dataset_path}']
 label_path = dataset_path + '/label.ini'
 checkpoint_config = dict(interval=10)

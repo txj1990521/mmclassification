@@ -1,5 +1,7 @@
+custom_imports = dict(
+    imports=['mmcls.datasets.Mydataset'], allow_failed_imports=True)
 _base_ = ['D:/SonicGitProject/mmclassification/configs/_base_/default_runtime.py']
-dataset_type = 'MNIST'
+dataset_type = 'MyDataset'
 classes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']  # The category names of your dataset
 
 img_norm_cfg = dict(
