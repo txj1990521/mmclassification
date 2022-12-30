@@ -1,5 +1,4 @@
 _base_ = [
-    '/home/txj/mmclassification/configs/_base_/models/resnet18_cifar.py',
     '/home/txj/mmclassification/config2/_base_/datasets/base_side_datasets.py',
     '/home/txj/mmclassification/configs/_base_/schedules/cifar10_bs128_数字测试.py',
     '/home/txj/mmclassification/configs/_base_/default_runtime.py'
@@ -15,7 +14,7 @@ load_from = None
 resume_from = None
 workflow = [('train', 1)]
 data = dict(
-    persistent_workers=False,
+    persistent_workers=True,
     samples_per_gpu=16,
     workers_per_gpu=2,
     train=dict(

@@ -780,9 +780,12 @@ class GenerateMmclsAnn:
                 class_id = str(class2id[d])
                 images = [x for x in image_path if d in x]
                 # images = glob(target_dir + d + '/*' + 'img_type')
+                basenames = []
                 for img in images:
-                    img = d + '/' + os.path.basename(img)
-                    annotations.append(img + ' ' + class_id + '\n')
+                    if d not in os.path.basename(img):
+                        img = d + '/' + os.path.basename(img)
+                        basenames.append(os.path.basename(img))
+                        annotations.append(img + ' ' + class_id + '\n')
             annotations[-1] = annotations[-1].strip()
             with open(ann_dir + sd + '.txt', 'w') as f:
                 f.writelines(annotations)

@@ -7,6 +7,23 @@ classes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']  # The category nam
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 
+model = dict(
+    type='ImageClassifier',
+    backbone=dict(
+        type='ResNet',
+        depth=18,
+        num_stages=4,
+        out_indices=(3, ),
+        style='pytorch'),
+    neck=dict(type='GlobalAveragePooling'),
+    head=dict(
+        type='LinearClsHead',
+        num_classes=31,
+        in_channels=512,
+        loss=dict(type='CrossEntropyLoss', loss_weight=1.0),
+        topk=(1, 5),
+    ))
+
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='RandomResizedCrop', size=224),
@@ -36,7 +53,6 @@ test_init_pipeline = [
     dict(type='CopyData2Local', target_dir='/home/txj/data/公共数据缓存', run_rsync=True),
     dict(type='LoadCategoryList', ignore_labels=['屏蔽']),
     dict(type='LoadPathList'),
-    dict(type='SplitData', start=0, end=0.8, key='path_set'),
     dict(type='StatCategoryCounter'),
     dict(type='GenerateMmclsAnn'),
 ]
