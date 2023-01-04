@@ -42,8 +42,6 @@ class LoadImageFromFile(object):
         if results['img_prefix'] is not None:
             filename = osp.join(results['img_prefix'],
                                 results['img_info']['filename'])
-
-
         else:
             filename = results['img_info']['filename']
 

@@ -329,6 +329,8 @@ def imshow_infos(img,
     Returns:
         np.ndarray: The image with extra infomations.
     """
+    # 设置字体为楷体
+
     with ImshowInfosContextManager(fig_size=fig_size) as manager:
         _, img = manager.put_img_infos(
             img,

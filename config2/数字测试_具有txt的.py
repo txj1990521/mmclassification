@@ -1,9 +1,17 @@
+import time
 _base_ = [
-    '/home/txj/mmclassification/config2/_base_/datasets/base_side_datasets.py',
-    '/home/txj/mmclassification/configs/_base_/schedules/cifar10_bs128_数字测试.py',
-    '/home/txj/mmclassification/configs/_base_/default_runtime.py'
+    # '/home/txj/mmclassification/config2/_base_/datasets/base_side_datasets.py',
+    # '/home/txj/mmclassification/configs/_base_/schedules/cifar10_bs128_数字测试.py',
+    # '/home/txj/mmclassification/configs/_base_/default_runtime.py'
+    './_base_/datasets/base_side_datasets.py',
+    './../configs/_base_/schedules/cifar10_bs128_数字测试.py',
+    './../configs/_base_/default_runtime.py'
 ]
+timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
 dataset_path = '/mnt/AIData/txj/data/十分区数据/train'
+val_path = ''
+project_name = '十分区数据'
+save_model_path = '/home/txj/model'
 dataset_path_list = [f'{dataset_path}']
 label_path = '/mnt/AIData/txj/data/十分区数据/' + 'label.ini'
 checkpoint_config = dict(interval=10)
@@ -35,10 +43,11 @@ data = dict(
 )
 evaluation = dict(interval=1, metric='accuracy')
 lr_config = dict(policy='step', step=[120, 170])
-runner = dict(type='EpochBasedRunner', max_epochs=200)
+# runner = dict(type='EpochBasedRunner', max_epochs=200)
+runner = dict(
+    save_model_path=f"{save_model_path}/{project_name}",
+    timestamp=timestamp,
+    max_epochs=200)
 # optimizer
 optimizer = dict(type='Adam', lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
 optimizer_config = dict(grad_clip=None)
-# learning policy
-lr_config = dict(policy='step', step=[100, 150])
-runner = dict(type='EpochBasedRunner', max_epochs=200)
