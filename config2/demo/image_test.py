@@ -11,7 +11,7 @@ from mmdet.utils import get_root_logger
 from tqdm import tqdm
 from mmcls.apis import inference_model, init_model
 
-dataset_path = f'D:\data\胃壁地图数据v2.0测试集\安汉润\十分区'
+dataset_path = f'Z:/txj/data/十分区数据/val'
 file_root = dataset_path  # 当前文件夹下的所有图片
 Run_config = 'config2/数字测试_具有txt的.py'
 class_checkpoint = 'work_dirs/数字测试_具有txt的/epoch_200.pth'
@@ -55,6 +55,8 @@ def main():
     elif isinstance(args.img_path, str):
         path_list = glob(f'{args.img_path}/**/*', recursive=True)
     badpath_list = []
+    print('识别的图片路径:' + dataset_path)
+    logger.info('识别的图片路径:' + dataset_path)
     for imgpath in tqdm(path_list, desc='读取进度'):
         if imgpath.endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp')):
             totalnum += 1
@@ -74,7 +76,7 @@ def main():
     logger.info('错误率:' + str(badnum / totalnum))
     for y in badpath_list:
         print('错误的识别名称:' + y)
-        logger.info('错误的识别名称:' + y)
+        logger.warning('错误的识别名称:' + y)
     sys.exit()
     # for key, value in result.items():
     #     print('{key}:{value}'.format(key=key, value=value))

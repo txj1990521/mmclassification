@@ -4,15 +4,16 @@ _base_ = [
     # '/home/txj/mmclassification/configs/_base_/schedules/cifar10_bs128_数字测试.py',
     # '/home/txj/mmclassification/configs/_base_/default_runtime.py'
     './_base_/datasets/base_side_datasets.py',
-    './../configs/_base_/schedules/cifar10_bs128_数字测试.py',
+    './_base_/schedules/side_schedules.py',
     './../configs/_base_/default_runtime.py'
 ]
 timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
 dataset_path = '/mnt/AIData/txj/data/十分区数据/train'
-val_path = ''
+val_path = '/mnt/AIData/txj/data/十分区数据/val'
 project_name = '十分区数据'
 save_model_path = '/home/txj/model'
 dataset_path_list = [f'{dataset_path}']
+dataset_val_path_list = [f'{val_path}']
 label_path = '/mnt/AIData/txj/data/十分区数据/' + 'label.ini'
 checkpoint_config = dict(interval=10)
 log_config = dict(interval=100, hooks=[dict(type='TextLoggerHook')])
@@ -32,13 +33,13 @@ data = dict(
     ),
     val=dict(
         label_path=label_path,
-        dataset_path_list=dataset_path_list,
-        data_prefix=dataset_path_list,
+        dataset_path_list=dataset_val_path_list,
+        data_prefix=dataset_val_path_list,
     ),
     test=dict(
         label_path=label_path,
-        dataset_path_list=dataset_path_list,
-        data_prefix=dataset_path_list,
+        dataset_path_list=dataset_val_path_list,
+        data_prefix=dataset_val_path_list,
     )
 )
 evaluation = dict(interval=1, metric='accuracy')

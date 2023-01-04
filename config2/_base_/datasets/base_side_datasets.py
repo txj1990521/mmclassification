@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 custom_imports = dict(
-    imports=['config2._base_.datasets.class_dataset', 'side_ai.pipelines.init_pipelines'], allow_failed_imports=True)
+    imports=['config2._base_.datasets.class_dataset',
+             'side_ai.pipelines.init_pipelines',
+             'side_ai.side_after_run_hook',
+             'side_ai.side_epoch_based_runner',
+             'side_ai.pipelines.save_pipeline',
+             'side_ai.pipelines.after_run_pipeline'], allow_failed_imports=True)
 dataset_type = 'ClassDataset'
 classes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']  # The category names of your dataset
 
@@ -13,7 +18,7 @@ model = dict(
         type='ResNet',
         depth=18,
         num_stages=4,
-        out_indices=(3, ),
+        out_indices=(3,),
         style='pytorch'),
     neck=dict(type='GlobalAveragePooling'),
     head=dict(
