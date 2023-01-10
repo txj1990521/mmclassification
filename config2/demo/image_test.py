@@ -11,6 +11,9 @@ from mmdet.utils import get_root_logger
 from tqdm import tqdm
 from mmcls.apis import inference_model, init_model
 from sklearn.metrics import confusion_matrix
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
 
 dataset_path = f'Z:/txj/data/十分区数据/val2'
 file_root = dataset_path  # 当前文件夹下的所有图片
@@ -78,7 +81,6 @@ def main():
             else:
                 badpath_list.append(imgpath + ' ' + '实际预测:' + currentlabel)
                 badnum += 1
-    matrix_array = confusion_matrix(y_true, y_pred)
     print('总数:' + str(totalnum))
     logger.info('总数:' + str(totalnum))
     print('准确率:' + str(goodnum / totalnum))
@@ -90,6 +92,60 @@ def main():
     for y in badpath_list:
         print('错误的识别名称:' + y)
         logger.warning('错误的识别名称:' + y)
+    classes = ['体上', '体下', '十二指肠', '胃体大弯', '胃体小弯', '胃底', '胃窦', '胃角', '贲门', '食管']
+    # 矩阵初始化
+    matrix_array = np.array(confusion_matrix(y_true, y_pred), dtype=np.int64)
+    # classes = list(set(y_true))
+    proportion = []
+    length = len(matrix_array)
+    print(length)
+    for i in matrix_array:
+        for j in i:
+            temp = j / (np.sum(i))
+            proportion.append(temp)
+    # print(np.sum(confusion_matrix[0]))
+    # print(proportion)
+    pshow = []
+    for i in proportion:
+        pt = "%.2f%%" % (i * 100)
+        pshow.append(pt)
+    proportion = np.array(proportion).reshape(length, length)  # reshape(列的长度，行的长度)
+    pshow = np.array(pshow).reshape(length, length)
+    # print(pshow)
+    # 设置混淆矩阵图片样式
+    config = {
+        # "font.family": 'Times New Roman',  # 设置字体类型
+        "font.sans-serif": "SimHei",
+        "axes.unicode_minus": False,
+    }
+    rcParams.update(config)
+    plt.imshow(proportion, interpolation='nearest', cmap=plt.cm.Blues)  # 按照像素显示出矩阵
+    # (改变颜色：'Greys', 'Purples', 'Blues', 'Greens', 'Oranges', 'Reds','YlOrBr', 'YlOrRd',
+    # 'OrRd', 'PuRd', 'RdPu', 'BuPu','GnBu', 'PuBu', 'YlGnBu', 'PuBuGn', 'BuGn', 'YlGn')
+    plt.title('confusion_matrix')
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=30, fontsize=8)
+    plt.yticks(tick_marks, classes, rotation=0, fontsize=8)
+    # 计算准确率数值及颜色渐变设置
+    iters = np.reshape([[[i, j] for j in range(length)] for i in range(length)], (matrix_array.size, 2))
+    for i, j in iters:
+        if (i == j):
+            plt.text(j, i - 0.12, format(matrix_array[i, j]), va='center', ha='center', fontsize=6, color='white',
+                     weight=5)  # 显示对应的数字
+            plt.text(j, i + 0.12, pshow[i, j], va='center', ha='center', fontsize=6, color='white')
+        else:
+            plt.text(j, i - 0.12, format(matrix_array[i, j]), va='center', ha='center', fontsize=6)  # 显示对应的数字
+            plt.text(j, i + 0.12, pshow[i, j], va='center', ha='center', fontsize=6)
+
+    plt.ylabel('True label', fontsize=16)
+    plt.xlabel('Predict label', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(dataset_path+'/'+str(current_time)+'_'+'混淆矩阵.jpg',dpi=300)
+    print('混淆矩阵图保存在:' + str(dataset_path+'/'+str(current_time)+'_'+'混淆矩阵.jpg'))
+    logger.info('混淆矩阵图保存在:' + str(dataset_path+'/'+str(current_time)+'_'+'混淆矩阵.jpg'))
+    plt.show()
+
     sys.exit()
 
 

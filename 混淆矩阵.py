@@ -54,18 +54,18 @@ plt.imshow(proportion, interpolation='nearest', cmap=plt.cm.Blues)  # 按照像�
 # plt.title('confusion_matrix')
 plt.colorbar()
 tick_marks = np.arange(len(classes))
-plt.xticks(tick_marks, classes, fontsize=12)
-plt.yticks(tick_marks, classes, fontsize=12)
+plt.xticks(tick_marks, classes, rotation=30, fontsize=8)
+plt.yticks(tick_marks, classes, rotation=0, fontsize=8)
 # 计算准确率数值及颜色渐变设置
 iters = np.reshape([[[i, j] for j in range(length)] for i in range(length)], (confusion_matrix.size, 2))
 for i, j in iters:
     if (i == j):
-        plt.text(j, i - 0.12, format(confusion_matrix[i, j]), va='center', ha='center', fontsize=10, color='white',
+        plt.text(j, i - 0.12, format(confusion_matrix[i, j]), va='center', ha='center', fontsize=8, color='white',
                  weight=5)  # 显示对应的数字
-        plt.text(j, i + 0.12, pshow[i, j], va='center', ha='center', fontsize=10, color='white')
+        plt.text(j, i + 0.12, pshow[i, j], va='center', ha='center', fontsize=8, color='white')
     else:
-        plt.text(j, i - 0.12, format(confusion_matrix[i, j]), va='center', ha='center', fontsize=10)  # 显示对应的数字
-        plt.text(j, i + 0.12, pshow[i, j], va='center', ha='center', fontsize=10)
+        plt.text(j, i - 0.12, format(confusion_matrix[i, j]), va='center', ha='center', fontsize=8)  # 显示对应的数字
+        plt.text(j, i + 0.12, pshow[i, j], va='center', ha='center', fontsize=8)
 
 plt.ylabel('True label', fontsize=16)
 plt.xlabel('Predict label', fontsize=16)
