@@ -18,7 +18,7 @@ from mmcv.runner.dist_utils import master_only
 from torch import distributed as dist
 from tqdm import tqdm
 from mmcls.datasets.builder import PIPELINES
-from mmdet.utils import get_root_logger
+from mmcls.utils import get_root_logger
 from side_ai.pipelines.utils_labelme import copy_json_and_img, shape_to_points, _annotation
 
 # -*- coding: utf-8 -*-
@@ -376,6 +376,7 @@ class SplitData:
             end = self.end
 
         target_list = results[self.key]
+        target_list = list(target_list)
         if self.shuffle:
             state = random.getstate()
             random.seed(self.seed)
@@ -762,34 +763,34 @@ class GenerateMmclsAnn:
         data_dir = str(Path(up_path)) + '/'
         classes = results['category_list']
         class2id = dict(zip(classes, range(len(classes))))
-        dir_types = ['train', 'val', 'test']
-        sub_dirs = os.listdir(data_dir)
-        for y in [x for x in sub_dirs if x.endswith('ini') or 'meta' in x]:
-            sub_dirs.remove(y)
+        # dir_types = ['train', 'val', 'test']
+        # sub_dirs = os.listdir(data_dir)
+        # for y in [x for x in sub_dirs if x.endswith('ini') or 'meta' in x]:
+        #     sub_dirs.remove(y)
         image_path = results['path_set']
-
-        ann_dir = data_dir + 'meta/'
-        if not os.path.exists(ann_dir):
-            os.makedirs(ann_dir)
-        for sd in sub_dirs:
-            if sd not in dir_types:
-                continue
-            annotations = []
-            target_dir = data_dir + sd + '/'
-            for d in os.listdir(target_dir):
-                class_id = str(class2id[d])
-                images = [x for x in image_path if d in x]
-                # images = glob(target_dir + d + '/*' + 'img_type')
-                basenames = []
-                for img in images:
-                    if d not in os.path.basename(img):
-                        img = d + '/' + os.path.basename(img)
-                        basenames.append(os.path.basename(img))
-                        annotations.append(img + ' ' + class_id + '\n')
-            annotations[-1] = annotations[-1].strip()
-            with open(ann_dir + sd + '.txt', 'w') as f:
-                f.writelines(annotations)
-        results['classification_ann_path'] = ann_dir + sd + '.txt'
+        # ann_dir = data_dir + 'meta/'
+        # if not os.path.exists(ann_dir):
+        #     os.makedirs(ann_dir)
+        # for sd in sub_dirs:
+        #     if sd not in dir_types:
+        #         continue
+        annotations = []
+        # target_dir = data_dir + sd + '/'
+        target_dir = results['dataset_path_list'][0]
+        for d in os.listdir(target_dir):
+            class_id = str(class2id[d])
+            images = [x for x in image_path if d in x]
+            # images = glob(target_dir + d + '/*' + 'img_type')
+            basenames = []
+            for img in images:
+                if d not in os.path.basename(img):
+                    img = d + '/' + os.path.basename(img)
+                    basenames.append(os.path.basename(img))
+                    annotations.append(img + ' ' + class_id + '\n')
+        annotations[-1] = annotations[-1].strip()
+        #     with open(ann_dir + sd + '.txt', 'w') as f:
+        #         f.writelines(annotations)
+        # results['classification_ann_path'] = ann_dir + sd + '.txt'
         results['classification_ann'] = annotations
 
         return results

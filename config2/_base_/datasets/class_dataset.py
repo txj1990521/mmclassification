@@ -51,31 +51,31 @@ class ClassDataset(BaseDataset):
             self.timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
         self.pipeline = Compose(pipeline)
         self.CLASSES = self.get_classes(self.data['category_list'])
-        self.ann_file = expanduser(self.data['classification_ann_path'])
+        # self.ann_file = expanduser(self.data['classification_ann_path'])
         self.test_mode = test_mode
         self.data_infos = self.load_annotations()
 
-    def load_annotations(self):
-        assert isinstance(self.ann_file, str)
-
-        data_infos = []
-        with open(self.ann_file) as f:
-            samples = [x.rsplit(' ', 1) for x in f.readlines()]
-            for filename, gt_label in samples:
-                info = {'img_prefix': self.data_prefix}
-                info['img_info'] = {'filename': filename}
-                info['gt_label'] = np.array(gt_label.replace('\n', ''), dtype=np.int64)
-                data_infos.append(info)
-            return data_infos
-
     # def load_annotations(self):
-    #     # assert isinstance(self.ann_file, str)
+    #     assert isinstance(self.ann_file, str)
+    #
     #     data_infos = []
-    #     samples = [x.rsplit(' ', 1) for x in self.data['classification_ann']]
-    #     for filename, gt_label in samples:
-    #         info = {'img_prefix': self.data_prefix}
-    #         info['img_info'] = {'filename': filename}
-    #         gt_label = gt_label.replace('\n', '')
-    #         info['gt_label'] = np.array(gt_label, dtype=np.int64)
-    #         data_infos.append(info)
-    #     return data_infos
+    #     with open(self.ann_file) as f:
+    #         samples = [x.rsplit(' ', 1) for x in f.readlines()]
+    #         for filename, gt_label in samples:
+    #             info = {'img_prefix': self.data_prefix}
+    #             info['img_info'] = {'filename': filename}
+    #             info['gt_label'] = np.array(gt_label.replace('\n', ''), dtype=np.int64)
+    #             data_infos.append(info)
+    #         return data_infos
+
+    def load_annotations(self):
+        # assert isinstance(self.ann_file, str)
+        data_infos = []
+        samples = [x.rsplit(' ', 1) for x in self.data['classification_ann']]
+        for filename, gt_label in samples:
+            info = {'img_prefix': self.data_prefix}
+            info['img_info'] = {'filename': filename}
+            gt_label = gt_label.replace('\n', '')
+            info['gt_label'] = np.array(gt_label, dtype=np.int64)
+            data_infos.append(info)
+        return data_infos
