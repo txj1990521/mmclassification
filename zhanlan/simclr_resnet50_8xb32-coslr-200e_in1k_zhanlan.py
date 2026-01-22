@@ -1,11 +1,8 @@
 _base_ = [
-    '../_base_/datasets/imagenet_bs32_simclr_zhanlan.py',
-    '../_base_/schedules/imagenet_lars_coslr_200e.py',
-    '../_base_/default_runtime.py',
+    'imagenet_bs32_simclr_zhanlan.py',
+    '../configs/_base_/schedules/imagenet_lars_coslr_200e.py',
+    '../configs/_base_/default_runtime.py',
 ]
-
-# dataset settings
-train_dataloader = dict(batch_size=256)
 
 # model settings
 model = dict(
@@ -31,7 +28,7 @@ model = dict(
 # optimizer
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='LARS', lr=4.8, momentum=0.9, weight_decay=1e-6),
+    optimizer=dict(type='LARS', lr=0.3, momentum=0.9, weight_decay=1e-6),
     paramwise_cfg=dict(
         custom_keys={
             'bn': dict(decay_mult=0, lars_exclude=True),
@@ -39,8 +36,16 @@ optim_wrapper = dict(
             # bn layer in ResNet block downsample module
             'downsample.1': dict(decay_mult=0, lars_exclude=True),
         }))
-
+visualizer = None
 # runtime settings
 default_hooks = dict(
-    # only keeps the latest 3 checkpoints
-    checkpoint=dict(type='CheckpointHook', interval=10, max_keep_ckpts=3))
+    checkpoint=dict(type='CheckpointHook', interval=10, max_keep_ckpts=3),
+    visualization=dict(type='VisualizationHook', enable=False),
+)
+
+
+
+# NOTE: `auto_scale_lr` is for automatically scaling LR
+# based on the actual training batch size.
+auto_scale_lr = dict(base_batch_size=256)
+

@@ -13,8 +13,8 @@ from typing import List, Tuple, Optional, Dict
 # CONFIG (直接改这里)
 # =========================
 
-INPUT_PATH = r"D:/zhanlan/data"
-OUTPUT_DIR = r"D:/zhanlan/output"
+INPUT_PATH = r"D:/zhanlan/test_data"
+OUTPUT_DIR = r"D:/zhanlan/test_output"
 
 RECURSIVE = True
 LIMIT_IMAGES = 0
@@ -141,7 +141,7 @@ def score_patch(patch, sharp_min):
         if mag[border].mean() > mag[~border].mean() * 1.3:
             edge_penalty = 1
         # 前景覆盖率：梯度明显的像素占比（自适应阈值）
-    t_fg = np.percentile(mag, 90)  # 更严格一点
+    t_fg = np.percentile(mag, 97)
     foreground_ratio = float((mag > t_fg).mean()) if t_fg > 1e-6 else 0.0
     # passed = texture_ratio >= TEXTURE_RATIO_MIN and sharpness >= sharp_min
     passed = (texture_ratio >= TEXTURE_RATIO_MIN) and (sharpness >= sharp_min) and (
@@ -210,6 +210,7 @@ def cut_one_image(img_path):
                     "sharpness": float(sc["sharpness"]),
                     "illum_penalty": int(sc["illum_penalty"]),
                     "edge_penalty": int(sc["edge_penalty"]),
+                    "foreground_ratio": float(sc["foreground_ratio"]),
                 })
 
         candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)

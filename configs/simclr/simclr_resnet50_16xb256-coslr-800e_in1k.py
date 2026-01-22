@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/datasets/imagenet_bs32_simclr.py',
+    '../_base_/datasets/imagenet_bs32_simclr_zhanlan.py',
     '../_base_/schedules/imagenet_lars_coslr_200e.py',
     '../_base_/default_runtime.py',
 ]
