@@ -10,6 +10,7 @@ model = dict(
     backbone=dict(
         type='ResNet',
         depth=50,
+        out_indices=(2, 3),
         norm_cfg=dict(type='SyncBN'),
         zero_init_residual=True),
     neck=dict(
