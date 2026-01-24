@@ -20,7 +20,7 @@ CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-20
 OUT_VIZ = r"D:\zhanlan\topk_viz1.jpg"  # 输出拼图
 TILE = 320  # 每张图显示尺寸（正方形，越大越清晰）
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\333.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\003b.jpg"
 
 OUT_INDEX = r"D:\zhanlan\faiss.index"
 OUT_META  = r"D:\zhanlan\faiss_paths.npy"

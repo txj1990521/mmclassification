@@ -27,7 +27,7 @@ from mmpretrain.registry import MODELS
 # =========================
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
-QUERY_IMG = r"D:\zhanlan\qurrey_data\333.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\111a.jpg"
 
 # 旧的全局特征库（最后层+GAP）对应的 FAISS index
 OUT_INDEX = r"D:\zhanlan\faiss.index"
@@ -37,7 +37,7 @@ TOPK = 10
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 输出拼图
-OUT_VIZ = r"D:\zhanlan\topk_viz_rmac11.jpg"
+OUT_VIZ = r"D:\zhanlan\topk_viz_rmac_backup.jpg"
 TILE = 320
 
 # ---------- Stage-1 粗召回 ----------

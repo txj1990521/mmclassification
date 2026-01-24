@@ -18,7 +18,7 @@ from mmpretrain.registry import MODELS
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\333.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\555.jpg"
 
 OUT_INDEX = r"D:\zhanlan\faiss.index"
 OUT_META  = r"D:\zhanlan\faiss_paths.npy"
@@ -44,6 +44,21 @@ ROT_DEGS = [-30, -15, 0, 15, 30]
 FIVE_CROP = True
 CROP_SIZE = 224
 RESIZE_SHORT = 256
+# ---------- Route-B query views (coarse aligned) ----------
+VIEWS_PER_QUERY = 12
+ROT_LIST = [-30, -15, 0, 15, 30]
+
+# 和建库一致的 view 计划（总 12）
+VIEW_PLAN = [
+    (0,   1, 5),   # deg=0: 1 center + 5 random
+    (-15, 1, 1),
+    (15,  1, 1),
+    (-30, 1, 0),
+    (30,  1, 0),
+]
+
+# 让 random crop 可复现（同一张图每次搜结果更稳定）
+QUERY_RANDOM_SEED = 0
 
 # ---------- Rerank（几何投票 + 周期/非周期自适应） ----------
 FEAT_LEVEL = -2
@@ -52,11 +67,11 @@ RMAC_INPUT_SHORT = 512
 KEEP_PATCHES = 512
 BORDER = 0.15
 
-MARGIN = 0.02
-MIN_KEEP = 8
+MARGIN = 0.03
+MIN_KEEP = 14
 
 BIN_SIZE = 4.0
-TOPM = 6
+TOPM = 8
 TOPK_CORE = 64
 
 # 融合权重（最终推荐）
@@ -64,8 +79,8 @@ W_COARSE = 0.65
 W_RERANK = 0.35
 
 # 周期纹理判别（稳定阈值）
-PERIODIC_PEAK_THR = 0.22
-PERIODIC_COVER_THR = 0.55
+PERIODIC_PEAK_THR = 0.18
+PERIODIC_COVER_THR = 0.65
 
 # =========================
 # utils: 中文路径 imread / imwrite
@@ -151,6 +166,58 @@ def to_tensor_from_rgb_crop(img_rgb_crop: np.ndarray, mean, std):
     x = (x - mean) / std
     x = np.transpose(x, (2, 0, 1))
     return torch.from_numpy(x)
+
+import random
+
+def random_crop(img_rgb: np.ndarray, size=224):
+    h, w = img_rgb.shape[:2]
+    if h < size or w < size:
+        scale = size / min(h, w)
+        nh, nw = int(round(h * scale)), int(round(w * scale))
+        img_rgb = cv2.resize(img_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        h, w = img_rgb.shape[:2]
+    y = random.randint(0, h - size)
+    x = random.randint(0, w - size)
+    return img_rgb[y:y+size, x:x+size]
+
+def power_norm_torch(x: torch.Tensor, eps: float = 1e-12):
+    return torch.sign(x) * torch.sqrt(torch.clamp(torch.abs(x), min=eps))
+
+@torch.no_grad()
+def aggregate_views_to_one(feats_view: torch.Tensor):
+    """
+    feats_view: (V,D) 已 L2
+    聚合：max pooling + power norm + L2
+    """
+    agg = feats_view.max(dim=0).values  # (D,)
+    agg = power_norm_torch(agg)
+    agg = F.normalize(agg.unsqueeze(0), p=2, dim=1).squeeze(0)
+    return agg
+
+@torch.no_grad()
+def make_query_views_routeB(img_bgr: np.ndarray, mean, std, to_rgb: bool,
+                           resize_short=256, crop_size=224):
+    # 固定 random seed：同一张 query 每次结果稳定
+    random.seed(QUERY_RANDOM_SEED)
+
+    if to_rgb:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    else:
+        img_rgb = img_bgr[:, :, ::-1].copy()
+
+    img_rgb = resize_short_edge(img_rgb, resize_short)
+
+    views = []
+    for deg, n_center, n_rand in VIEW_PLAN:
+        rot = rotate_bound(img_rgb, deg)
+        for _ in range(n_center):
+            c = crop_center(rot, crop_size)
+            views.append(to_tensor_from_rgb_crop(c, mean, std))
+        for _ in range(n_rand):
+            c = random_crop(rot, crop_size)
+            views.append(to_tensor_from_rgb_crop(c, mean, std))
+
+    return views[:VIEWS_PER_QUERY]
 
 # =========================
 # model
@@ -441,7 +508,14 @@ def enforce_coarse_floor(order_final, coarse_scores, final_scores,
     top = sorted(top, key=lambda i: final_scores[i], reverse=True)
     return np.array(top, dtype=np.int64)
 
-def fuse_scores(coarse, rerank, wC=0.70, wR=0.30, T=0.70, gamma=0.85):
+def rank_norm(x: np.ndarray):
+    # 越大越好，按名次转 0~1
+    order = np.argsort(x)  # asc
+    r = np.empty_like(order, dtype=np.float32)
+    r[order] = np.linspace(0, 1, num=len(x), dtype=np.float32)
+    return r
+
+def fuse_scores(coarse, rerank, wC=0.75, wR=0.25, T=0.70, gamma=0.85):
     """
     coarse, rerank: float in [0,1]
     T: coarse gating threshold
@@ -451,7 +525,7 @@ def fuse_scores(coarse, rerank, wC=0.70, wR=0.30, T=0.70, gamma=0.85):
 
     if coarse < T:
         # coarse 不够像：rerank 只给很小的影响，防止 img449 这种冲上来
-        return 0.90 * coarse + 0.10 * r
+        return 0.92 * coarse + 0.08 * r
     else:
         # coarse 够像：正常融合
         return wC * coarse + wR * r
@@ -517,31 +591,24 @@ def main():
         raise RuntimeError(f"Cannot read query image: {QUERY_IMG}")
 
     # ---------- Stage-1: coarse recall ----------
-    views = make_query_views_for_coarse(qimg, mean, std, to_rgb=to_rgb)
-    print(f"[INFO] coarse views = {len(views)}")
+    # ---------- Stage-1: coarse recall (Route-B aligned: views -> one vector -> search once) ----------
+    views = make_query_views_routeB(qimg, mean, std, to_rgb=to_rgb,
+                                    resize_short=RESIZE_SHORT, crop_size=CROP_SIZE)
+    print(f"[INFO] coarse views(RouteB) = {len(views)}")
 
-    best_score = {}  # id -> best score
-    bs = COARSE_BATCH
-    for st in range(0, len(views), bs):
-        bt = torch.stack(views[st:st+bs], dim=0).to(DEVICE)
-        feats = extract_global_feat_for_coarse(model, bt).cpu().numpy().astype("float32")
+    bt = torch.stack(views, dim=0).to(DEVICE)  # (V,3,224,224)
+    feats_v = extract_global_feat_for_coarse(model, bt)  # (V,D) 已 L2
+    qvec = aggregate_views_to_one(feats_v).unsqueeze(0).cpu().numpy().astype("float32")  # (1,D)
 
-        scores, ids = index.search(feats, PER_VIEW_SEARCH_K)
-        for row_s, row_i in zip(scores, ids):
-            for s, idx in zip(row_s, row_i):
-                if idx < 0:
-                    continue
-                s = float(s)
-                prev = best_score.get(int(idx))
-                if prev is None or s > prev:
-                    best_score[int(idx)] = s
+    # 直接搜索 COARSE_K
+    scores, ids = index.search(qvec, COARSE_K)
+    ids = ids[0].tolist()
+    scores = scores[0].tolist()
 
-    coarse_items = sorted(best_score.items(), key=lambda x: x[1], reverse=True)[:COARSE_K]
-    coarse_ids = [i for i, _ in coarse_items]
-    coarse_scores_top = [float(s) for _, s in coarse_items]
+    coarse_ids = [i for i in ids if i >= 0]
+    coarse_scores_top = [float(s) for i, s in zip(ids, scores) if i >= 0]
     coarse_paths = [kept_paths[i] for i in coarse_ids]
     print(f"[INFO] coarse candidates = {len(coarse_ids)}")
-
     # ---------- Stage-2: rerank ----------
     qx = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
     q_fm = extract_featmap(model, qx, FEAT_LEVEL)
@@ -584,9 +651,8 @@ def main():
     coarse_raw = np.array(valid_coarse_scores, dtype=np.float32)  # 用于保底策略（不要minmax）
     rerank_raw = np.array(sims, dtype=np.float32)
 
-    cs = _minmax(coarse_raw)
-    rs = _minmax(rerank_raw)
-
+    cs = rank_norm(coarse_raw)
+    rs = rank_norm(rerank_raw)
     final = np.array([fuse_scores(cs[i], rs[i]) for i in range(len(cs))], dtype=np.float32)
 
     # 先按 final 全量排序（不要先截TOPK）
