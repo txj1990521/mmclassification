@@ -204,6 +204,19 @@ def select_top_patches_with_xy(feat_map_1bchw: torch.Tensor, keep=256, border=0.
 def imread_unicode(p):
     return cv2.imdecode(np.fromfile(p, np.uint8), cv2.IMREAD_COLOR)
 
+def rotate_bgr(img, deg):
+    if deg == 0:
+        return img
+    h, w = img.shape[:2]
+    cx, cy = w * 0.5, h * 0.5
+    M = cv2.getRotationMatrix2D((cx, cy), deg, 1.0)
+    cos = abs(M[0,0]); sin = abs(M[0,1])
+    nw = int(h*sin + w*cos)
+    nh = int(h*cos + w*sin)
+    M[0,2] += (nw/2) - cx
+    M[1,2] += (nh/2) - cy
+    return cv2.warpAffine(img, M, (nw, nh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+
 def ensure_dir(p):
     Path(p).mkdir(parents=True, exist_ok=True)
 
@@ -551,6 +564,11 @@ def aggregate_patch_hits(patch_ids, patch_scores, patch_meta,
     fused = fused[:top_images]
     return [i for i, _ in fused]
 
+def rank_to_rrf_score(rank_list, k=60):
+    s = {}
+    for r, i in enumerate(rank_list, 1):
+        s[i] = 1.0 / (k + r)
+    return s
 
 
 
@@ -718,9 +736,21 @@ def main():
     print("[GLOBAL] top global-rank ids:", global_rank[:10])
 
     # -------- RRF fusion
+
     fused = rrf_fuse(global_rank, patch_rank, RRF_K)
     fused = fused[:GEOM_TOPN]
+    rrf_score = rank_to_rrf_score(fused, k=RRF_K)
 
+    q_desc_list = []
+    q_xy_list = []
+
+    for ang in [-30, -15, 0, 15, 30]:
+        qimg_r = rotate_bgr(qimg, ang)
+        qx = make_single_tensor_for_rerank(qimg_r, mean, std, to_rgb=to_rgb).to(DEVICE)
+        q_fm = extract_featmap(model, qx, FEAT_LEVEL)
+        q_desc, q_xy = select_query_patches(q_fm)
+        q_desc_list.append(q_desc)
+        q_xy_list.append(q_xy)
 
     # -------- Deep geom rerank (replace ORB)
     qx = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
@@ -728,6 +758,8 @@ def main():
     q_desc, q_xy = select_query_patches(q_fm)  # 你旧脚本里那套 ROI+full 混合即可
 
     scored = []
+
+
     for img_id in fused:
         cimg = imread_unicode(img_paths[img_id])
         if cimg is None:
@@ -736,19 +768,30 @@ def main():
         c_fm = extract_featmap(model, cx, FEAT_LEVEL)
         c_desc, c_xy = select_candidate_patches(c_fm)
 
-        s = geom_score_adaptive(
-            q_desc, q_xy, c_desc, c_xy,
-            margin=MARGIN, min_keep=MIN_KEEP,
-            bin_size=BIN_SIZE, topM=TOPM, topk_core=TOPK_CORE,
-            periodic_peak_thr=PERIODIC_PEAK_THR,
-            periodic_cover_topM_thr=PERIODIC_COVER_TOPM_THR,
-            periodic_cover_xy_thr=PERIODIC_COVER_XY_THR,
-            dbg=False
-        )
-        scored.append((img_id, s))
+        geom_best = 0.0
+        for q_desc, q_xy in zip(q_desc_list, q_xy_list):
+            s = geom_score_adaptive(
+                q_desc, q_xy, c_desc, c_xy,
+                margin=MARGIN, min_keep=MIN_KEEP,
+                bin_size=BIN_SIZE, topM=TOPM, topk_core=TOPK_CORE,
+                periodic_peak_thr=PERIODIC_PEAK_THR,
+                periodic_cover_topM_thr=PERIODIC_COVER_TOPM_THR,
+                periodic_cover_xy_thr=PERIODIC_COVER_XY_THR,
+                dbg=False
+            )
+            if s > geom_best:
+                geom_best = s
+        scored.append((img_id, geom_best))
     scored = [(i, s) for (i, s) in scored if s > 0]
     scored.sort(key=lambda x: x[1], reverse=True)
-    top = scored[:TOPK]
+    alpha = 3.0  # 这个先用 2~5，别太小（因为 geom 分很小）
+    final = []
+    for img_id, gs in scored:
+        fs = rrf_score.get(img_id, 0.0) + alpha * gs
+        final.append((img_id, fs, gs))
+
+    final.sort(key=lambda x: x[1], reverse=True)
+    top = final[:TOPK]
 
     # -------- Visualize
     imgs = []
