@@ -22,7 +22,7 @@ BORDER = 0.05
 
 MARGIN = 0.015      # 0.01~0.02
 MIN_KEEP = 6        # 6~10
-BIN_SIZE = 0.04
+BIN_SIZE = 0.05
 TOPK_CORE = 64
 
 PERIODIC_PEAK_THR  = 0.25
@@ -37,7 +37,7 @@ TOPM = 6
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\333.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\111c.jpg"
 
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
@@ -681,6 +681,21 @@ def visualize_grid(query_bgr, top_imgs_bgr, top_scores, out_path,
     cv2.imwrite(out_path, canvas)
     return out_path
 
+def clean_rank(rank_list):
+    seen = set()
+    out = []
+    for x in rank_list:
+        if x is None:
+            continue
+        x = int(x)
+        if x < 0:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
 
 # ============================================================
 # Main
@@ -716,6 +731,14 @@ def main():
     )
     print(f"[PATCH] query patches = {n_qpatch}, vecs shape = {q_patch_vecs.shape}")
 
+    def show_ids(ids, img_paths, title, n=15):
+        print(f"\n== {title} ==")
+        for k, i in enumerate(ids[:n], 1):
+            p = str(img_paths[i])
+            print(f"{k:02d}  id={i:<5d}  name={os.path.basename(p)}  path={p}")
+
+
+
     # 对每个 query patch 去搜 patch index
     patch_ids_all, patch_scores_all = [], []
     D, I = p_index.search(q_patch_vecs, PATCH_TOPK_PER_QPATCH)  # D/I: (P, K)
@@ -732,14 +755,21 @@ def main():
     patch_rank = aggregate_patch_hits(
         patch_ids_all, patch_scores_all, patch_meta, top_images=TOP_PATCH_IMAGES
     )
+    global_rank = clean_rank(gids[0].tolist())
+    patch_rank = clean_rank(patch_rank)
     print("[PATCH] top patch-rank ids:", patch_rank[:10])
     print("[GLOBAL] top global-rank ids:", global_rank[:10])
 
     # -------- RRF fusion
 
     fused = rrf_fuse(global_rank, patch_rank, RRF_K)
-    fused = fused[:GEOM_TOPN]
-    rrf_score = rank_to_rrf_score(fused, k=RRF_K)
+    fused = clean_rank(fused)[:GEOM_TOPN]
+    rrf_g = rank_to_rrf_score(global_rank, k=RRF_K)
+    rrf_p = rank_to_rrf_score(patch_rank, k=RRF_K)
+    rrf_score = {}
+    for d in (rrf_g, rrf_p):
+        for k, v in d.items():
+            rrf_score[k] = rrf_score.get(k, 0.0) + v
 
     q_desc_list = []
     q_xy_list = []
@@ -752,6 +782,9 @@ def main():
         q_desc_list.append(q_desc)
         q_xy_list.append(q_xy)
 
+    show_ids(global_rank, img_paths, "GLOBAL top")
+    show_ids(patch_rank, img_paths, "PATCH  top")
+    show_ids(fused, img_paths, "FUSED  top")
     # -------- Deep geom rerank (replace ORB)
     qx = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
     q_fm = extract_featmap(model, qx, FEAT_LEVEL)
@@ -784,28 +817,38 @@ def main():
         scored.append((img_id, geom_best))
     scored = [(i, s) for (i, s) in scored if s > 0]
     scored.sort(key=lambda x: x[1], reverse=True)
-    alpha = 3.0  # 这个先用 2~5，别太小（因为 geom 分很小）
+
+    geom_vals = [s for _, s in scored]
+    gmax = max(geom_vals) if geom_vals else 1.0
+    gmin = min(geom_vals) if geom_vals else 0.0
+
+    def norm_g(g):
+        return (g - gmin) / (gmax - gmin + 1e-9)
+
+    beta = 0.3  # 0.1~0.5 之间先试
     final = []
     for img_id, gs in scored:
-        fs = rrf_score.get(img_id, 0.0) + alpha * gs
+        fs = rrf_score.get(img_id, 0.0) * (1.0 + beta * norm_g(gs))
         final.append((img_id, fs, gs))
-
     final.sort(key=lambda x: x[1], reverse=True)
     top = final[:TOPK]
 
+    for r, (img_id, fs, gs) in enumerate(top, 1):
+        print(f"{r:02d}  final={fs:.4f}  geom={gs:.4f}  {img_paths[img_id]}")
+
     # -------- Visualize
     imgs = []
-    paths = []
-    for img_id,_ in top:
+    scores = []
+    for img_id, fs, gs in top:
         imgs.append(imread_unicode(img_paths[img_id]))
-        paths.append(img_paths[img_id])
+        scores.append(fs)
 
     out = os.path.join(OUT_DIR, "result_grid.png")
-    visualize_grid(qimg, imgs, [s for _, s in top], out, tile=320)
+    visualize_grid(qimg, imgs, scores, out, tile=320)
 
     print("Top results:")
-    for r,(img_id,s) in enumerate(top,1):
-        print(f"{r:02d}  score={s:.3f}  {img_paths[img_id]}")
+    for r,(img_id, fs, gs) in enumerate(top,1):
+        print(f"{r:02d}  score={fs:.3f}  {img_paths[img_id]}")
     print("Saved:", out)
 
 if __name__ == "__main__":
