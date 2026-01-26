@@ -37,7 +37,7 @@ TOPM = 6
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\IMG_5026c.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\111a.jpg"
 
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
@@ -901,7 +901,21 @@ def main():
         fs = final_rrf.get(img_id, 0.0) * (1.0 + beta * norm_g(gs))
         final.append((img_id, fs, gs))
     final.sort(key=lambda x: x[1], reverse=True)
-    top = final[:TOPK]
+    # final: [(img_id, fs, gs), ...]
+
+    scores = [fs for _, fs, _ in final]
+    s_min = min(scores)
+    s_max = max(scores) + 1e-9
+
+    final_norm = []
+    for img_id, fs, gs in final:
+        fs_norm = (fs - s_min) / (s_max - s_min)  # 0~1
+        final_norm.append((img_id, fs_norm, gs))
+
+    final_norm.sort(key=lambda x: x[1], reverse=True)
+    top = final_norm[:TOPK]
+
+    # top = final[:TOPK]
 
     for r, (img_id, fs, gs) in enumerate(top, 1):
         print(f"{r:02d}  final={fs:.4f}  geom={gs:.4f}  {img_paths[img_id]}")
