@@ -37,7 +37,7 @@ TOPM = 6
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\111c.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\IMG_5026c.jpg"
 
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
@@ -457,41 +457,79 @@ def _resize_long_edge(img_bgr, long_edge=768):
     nh, nw = max(1, int(round(h * s))), max(1, int(round(w * s)))
     return cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
 
-def _extract_patches_grid(img_bgr, patch_sizes=(256, 384, 512), stride_ratio=0.5,
-                          max_patches=64, border_frac=0.02):
-    """
-    多尺度网格切 patch，覆盖局部；返回 list[np.ndarray(BGR)]。
-    - stride_ratio=0.5 => 重叠一半
-    - max_patches 防止 query 太大切太多
-    """
+# def _extract_patches_grid(img_bgr, patch_sizes=(256, 384, 512), stride_ratio=0.5,
+#                           max_patches=64, border_frac=0.02):
+#     """
+#     多尺度网格切 patch，覆盖局部；返回 list[np.ndarray(BGR)]。
+#     - stride_ratio=0.5 => 重叠一半
+#     - max_patches 防止 query 太大切太多
+#     """
+#     H, W = img_bgr.shape[:2]
+#     patches = []
+#     for ps in patch_sizes:
+#         if min(H, W) < ps:
+#             continue
+#         stride = max(1, int(ps * stride_ratio))
+#         y0 = int(H * border_frac)
+#         x0 = int(W * border_frac)
+#         y1 = max(y0, H - int(H * border_frac) - ps)
+#         x1 = max(x0, W - int(W * border_frac) - ps)
+#
+#         ys = list(range(y0, y1 + 1, stride)) if y1 >= y0 else [max(0, (H-ps)//2)]
+#         xs = list(range(x0, x1 + 1, stride)) if x1 >= x0 else [max(0, (W-ps)//2)]
+#
+#         for y in ys:
+#             for x in xs:
+#                 patch = img_bgr[y:y+ps, x:x+ps]
+#                 if patch.shape[0] == ps and patch.shape[1] == ps:
+#                     patches.append(patch)
+#                 if len(patches) >= max_patches:
+#                     return patches
+#     # 兜底：至少给中心 patch
+#     if len(patches) == 0:
+#         s = min(H, W)
+#         y = (H - s) // 2
+#         x = (W - s) // 2
+#         patch = img_bgr[y:y+s, x:x+s]
+#         patches.append(patch)
+#     return patches
+#
+#
+
+
+def _extract_patches_grid(img_bgr, patch_sizes=(256,384,512), stride_ratio=0.5,
+                          max_patches=64, border_frac=0.02, roi_xyxy=None):
     H, W = img_bgr.shape[:2]
+    if roi_xyxy is not None:
+        x1,y1,x2,y2 = roi_xyxy
+        x1 = max(0,int(x1)); y1=max(0,int(y1)); x2=min(W,int(x2)); y2=min(H,int(y2))
+    else:
+        x1,y1,x2,y2 = 0,0,W,H
+
     patches = []
+    crop = img_bgr[y1:y2, x1:x2]
+    HH, WW = crop.shape[:2]
+
     for ps in patch_sizes:
-        if min(H, W) < ps:
+        if min(HH, WW) < ps:
             continue
         stride = max(1, int(ps * stride_ratio))
-        y0 = int(H * border_frac)
-        x0 = int(W * border_frac)
-        y1 = max(y0, H - int(H * border_frac) - ps)
-        x1 = max(x0, W - int(W * border_frac) - ps)
+        y0 = int(HH * border_frac); x0 = int(WW * border_frac)
+        y1m = max(y0, HH - int(HH * border_frac) - ps)
+        x1m = max(x0, WW - int(WW * border_frac) - ps)
 
-        ys = list(range(y0, y1 + 1, stride)) if y1 >= y0 else [max(0, (H-ps)//2)]
-        xs = list(range(x0, x1 + 1, stride)) if x1 >= x0 else [max(0, (W-ps)//2)]
+        ys = list(range(y0, y1m + 1, stride)) if y1m >= y0 else [max(0, (HH-ps)//2)]
+        xs = list(range(x0, x1m + 1, stride)) if x1m >= x0 else [max(0, (WW-ps)//2)]
 
-        for y in ys:
-            for x in xs:
-                patch = img_bgr[y:y+ps, x:x+ps]
-                if patch.shape[0] == ps and patch.shape[1] == ps:
+        for yy in ys:
+            for xx in xs:
+                patch = crop[yy:yy+ps, xx:xx+ps]
+                if patch.shape[0]==ps and patch.shape[1]==ps:
                     patches.append(patch)
                 if len(patches) >= max_patches:
                     return patches
-    # 兜底：至少给中心 patch
-    if len(patches) == 0:
-        s = min(H, W)
-        y = (H - s) // 2
-        x = (W - s) // 2
-        patch = img_bgr[y:y+s, x:x+s]
-        patches.append(patch)
+    if not patches:
+        patches.append(crop)
     return patches
 
 def get_query_patch_feats(model, mean, std, to_rgb, qimg_bgr,
@@ -508,9 +546,27 @@ def get_query_patch_feats(model, mean, std, to_rgb, qimg_bgr,
     """
     qimg = _resize_long_edge(qimg_bgr, long_edge=long_edge)
 
+    # 先在512输入上算roi（featmap坐标）
+    qx512 = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
+    qfm = extract_featmap(model, qx512, FEAT_LEVEL)  # (1,C,Hf,Wf)
+    roi_f = energy_roi_box(qfm[0], frac=0.18)  # (x1,y1,x2,y2) in featmap coords
+
+    # 把featmap ROI映射到512，再映射回原图
+    if roi_f is not None:
+        _, _, Hf, Wf = qfm.shape
+        x1, y1, x2, y2 = roi_f
+        x1 = x1 / (Wf - 1);
+        x2 = x2 / (Wf - 1)
+        y1 = y1 / (Hf - 1);
+        y2 = y2 / (Hf - 1)
+        H, W = qimg.shape[:2]
+        roi_xyxy = (x1 * W, y1 * H, x2 * W, y2 * H)
+    else:
+        roi_xyxy = None
+
     patches = _extract_patches_grid(
         qimg, patch_sizes=patch_sizes, stride_ratio=stride_ratio,
-        max_patches=max_patches
+        max_patches=max_patches,roi_xyxy=roi_xyxy
     )
 
     tensors = []
@@ -616,9 +672,7 @@ def geom_score(qimg, cimg):
     inliers = int(mask.sum())
     return inliers / (len(good) + 1e-6)
 
-# ============================================================
-# Visualization
-# ============================================================
+
 # ============================================================
 # Visualization (Grid)
 # ============================================================
@@ -640,6 +694,15 @@ def _fit_square(img_bgr, tile=320):
     canvas[y0:y0+nh, x0:x0+nw] = resized
     return canvas
 
+# 1) 计算一个“global置信度”：top聚集度（用top20里同一前缀/同一组的集中度替代也行）
+def global_confidence(global_rank, img_paths, topn=20):
+    names = [os.path.basename(str(img_paths[i])) for i in global_rank[:topn]]
+    # 例：按 IMG_483x 这种系列聚集（你可以换成更通用的：相似度gap/熵）
+    prefix = [n.split('_')[0] if '_' in n else n[:4] for n in names]
+    # 计算最常见prefix占比
+    from collections import Counter
+    c = Counter(prefix).most_common(1)[0][1]
+    return c / max(1, len(prefix))
 def visualize_grid(query_bgr, top_imgs_bgr, top_scores, out_path,
                    tile=320, gap=10, header=44):
     """
@@ -744,9 +807,6 @@ def main():
     D, I = p_index.search(q_patch_vecs, PATCH_TOPK_PER_QPATCH)  # D/I: (P, K)
     # D: (P,K) 对每个 query patch 内部做归一化，避免某个 patch 分值尺度异常
     D = D.astype(np.float32)
-    row_min = D.min(axis=1, keepdims=True)
-    row_max = D.max(axis=1, keepdims=True)
-    # D = (D - row_min) / (row_max - row_min + 1e-6)
 
     # 聚合所有 patch hit
     patch_ids_all = I.reshape(-1).tolist()
@@ -764,12 +824,22 @@ def main():
 
     fused = rrf_fuse(global_rank, patch_rank, RRF_K)
     fused = clean_rank(fused)[:GEOM_TOPN]
+
+
+
     rrf_g = rank_to_rrf_score(global_rank, k=RRF_K)
     rrf_p = rank_to_rrf_score(patch_rank, k=RRF_K)
-    rrf_score = {}
-    for d in (rrf_g, rrf_p):
-        for k, v in d.items():
-            rrf_score[k] = rrf_score.get(k, 0.0) + v
+
+    conf_g = global_confidence(global_rank, img_paths, topn=20)
+    # conf_g 越大，越信global
+    w_g = 0.6 + 0.35 * conf_g  # 大概落在[0.6, 0.95]
+    w_p = 1.0 - w_g
+
+    final_rrf = {}
+    for k, v in rrf_g.items():
+        final_rrf[k] = final_rrf.get(k, 0.0) + w_g * v
+    for k, v in rrf_p.items():
+        final_rrf[k] = final_rrf.get(k, 0.0) + w_p * v
 
     q_desc_list = []
     q_xy_list = []
@@ -828,7 +898,7 @@ def main():
     beta = 0.3  # 0.1~0.5 之间先试
     final = []
     for img_id, gs in scored:
-        fs = rrf_score.get(img_id, 0.0) * (1.0 + beta * norm_g(gs))
+        fs = final_rrf.get(img_id, 0.0) * (1.0 + beta * norm_g(gs))
         final.append((img_id, fs, gs))
     final.sort(key=lambda x: x[1], reverse=True)
     top = final[:TOPK]
