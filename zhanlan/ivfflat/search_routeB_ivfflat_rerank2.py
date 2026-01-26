@@ -37,7 +37,7 @@ TOPM = 6
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\111a.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\S8987B2-90#a.jpg"
 
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
@@ -231,6 +231,113 @@ def set_faiss_nprobe(index, nprobe=64):
     except Exception:
         pass
 
+@torch.no_grad()
+def geom_score_compatible(q_desc, q_xy, c_desc, c_xy,
+                          # struct params
+                          margin=0.015, min_keep=6,
+                          bin_size=0.05, topM=6, topk_core=64,
+                          periodic_peak_thr=0.25,
+                          periodic_cover_topM_thr=0.70,
+                          periodic_cover_xy_thr=0.22,
+                          # texture params
+                          tex_topk_core=128, tex_min_pairs=12,
+                          tex_weight=0.35):
+    """
+    返回一个最终的“几何相关”分数（兼容结构/纹理）
+    - 结构模式：用你的 geom_score_adaptive
+    - 纹理模式：用 texture_score，并乘 tex_weight 降权（避免误抬）
+    """
+    Ng0 = compute_Ng0(q_desc, c_desc, margin=margin)
+
+    # 结构模式
+    if Ng0 >= min_keep:
+        s = geom_score_adaptive(
+            q_desc, q_xy, c_desc, c_xy,
+            margin=margin, min_keep=min_keep,
+            bin_size=bin_size, topM=topM, topk_core=topk_core,
+            periodic_peak_thr=periodic_peak_thr,
+            periodic_cover_topM_thr=periodic_cover_topM_thr,
+            periodic_cover_xy_thr=periodic_cover_xy_thr,
+            dbg=False
+        )
+        return float(s)
+
+    # 纹理模式（降权）
+    s_tex = texture_score(
+        q_desc, q_xy, c_desc, c_xy,
+        bin_size=bin_size, topM=topM,
+        topk_core=tex_topk_core, min_pairs=tex_min_pairs
+    )
+    return float(s_tex * tex_weight)
+
+@torch.no_grad()
+def texture_score(q_desc, q_xy, c_desc, c_xy,
+                  bin_size=0.05, topM=6,
+                  topk_core=128, min_pairs=12):
+    sim = q_desc @ c_desc.t()
+    q_bestv, q_best = torch.max(sim, dim=1)        # (Nq,)
+
+    K = min(int(topk_core), q_desc.shape[0])
+    sel = torch.topk(q_bestv, k=K, largest=True).indices
+    if K < min_pairs:
+        return 0.0
+
+    qg = q_xy[sel]
+    cg = c_xy[q_best[sel]]
+    core = float(q_bestv[sel].mean().item())
+
+    d = cg - qg
+    dx_bin = torch.round(d[:, 0] / bin_size)
+    dy_bin = torch.round(d[:, 1] / bin_size)
+    keys = dx_bin * 10000 + dy_bin
+
+    _, cnt = torch.unique(keys, return_counts=True)
+    cntf = cnt.float()
+
+    peak_ratio = float(cntf.max().item()) / float(K)
+    m = min(int(topM), int(cnt.numel()))
+    cover_topM = float(torch.topk(cntf, k=m).values.sum().item()) / float(K)
+
+    # 纹理：更看重 cover_topM（集中在少数峰）
+    return float(core * (0.35 + 0.65 * cover_topM) * (0.5 + 0.5 * peak_ratio))
+
+
+@torch.no_grad()
+def geom_score_with_stats(q_desc, q_xy, c_desc, c_xy, **kw):
+    """
+    返回:
+      score_struct: float  # 你的原 geom_score_adaptive 分数
+      stats: dict          # 纹理门控需要的统计量
+    """
+    # --- 复制你 geom_score_adaptive 的前半段，直到算出 Ng0 ---
+    margin   = kw.get("margin", 0.015)
+    min_keep = kw.get("min_keep", 6)
+
+    sim = q_desc @ c_desc.t()
+    topv, topi = torch.topk(sim, k=2, dim=1, largest=True)
+    q_best  = topi[:, 0]
+    q_bestv = topv[:, 0]
+    q_2ndv  = topv[:, 1]
+
+    c_best = torch.argmax(sim, dim=0)
+    idx_q = torch.arange(q_desc.shape[0], device=sim.device)
+    mutual = (c_best[q_best] == idx_q)
+
+    good = mutual & ((q_bestv - q_2ndv) > margin)
+    Ng0 = int(good.sum().item())
+
+    # --- 结构分数：仍然调用你的原函数（完全不改它） ---
+    score_struct = geom_score_adaptive(q_desc, q_xy, c_desc, c_xy, **kw)
+
+    stats = {
+        "Ng0": Ng0,
+        "min_keep": int(min_keep),
+        "margin": float(margin),
+        "core_sim_mean": float(q_bestv.mean().item()),
+        "best_gap_mean": float((q_bestv - q_2ndv).mean().item()),
+    }
+    return score_struct, stats
+
 # ============================================================
 # Model
 # ============================================================
@@ -275,6 +382,8 @@ def geom_score_adaptive(
     good = mutual & ((q_bestv - q_2ndv) > margin)
     Ng0 = int(good.sum().item())
     if Ng0 < min_keep:
+        if dbg:
+            print(f"[DBG] early return: Ng0={Ng0} < min_keep={min_keep} (margin={margin})")
         return 0.0
 
     good_idx = torch.nonzero(good, as_tuple=False).squeeze(1)
@@ -289,6 +398,8 @@ def geom_score_adaptive(
     cg = c_xy[mi]           # (Ng,2)
     Ng = int(good_idx.numel())
     if Ng < min_keep:
+        if dbg:
+            print(f"[DBG] early return: Ng={Ng} < min_keep={min_keep}")
         return 0.0
 
     # ---- shape consistency: pairwise distance ratio ----
@@ -307,6 +418,8 @@ def geom_score_adaptive(
         ratios.append(torch.log(rr))
 
     if len(ratios) < 8:
+        if dbg:
+            print(f"[DBG] early return: ratios={len(ratios)} < 8 (Ng={Ng}, P={P})")
         return 0.0
 
     ratio_std = float(torch.stack(ratios).std().item())
@@ -694,6 +807,21 @@ def _fit_square(img_bgr, tile=320):
     canvas[y0:y0+nh, x0:x0+nw] = resized
     return canvas
 
+@torch.no_grad()
+def compute_Ng0(q_desc, c_desc, margin=0.015):
+    sim = q_desc @ c_desc.t()                      # (Nq, Nc)
+    topv, topi = torch.topk(sim, k=2, dim=1)       # q->c top1/top2
+    q_best  = topi[:, 0]
+    q_bestv = topv[:, 0]
+    q_2ndv  = topv[:, 1]
+
+    c_best = torch.argmax(sim, dim=0)              # c->q top1
+    idx_q = torch.arange(q_desc.shape[0], device=sim.device)
+    mutual = (c_best[q_best] == idx_q)
+
+    good = mutual & ((q_bestv - q_2ndv) > margin)
+    return int(good.sum().item())
+
 # 1) 计算一个“global置信度”：top聚集度（用top20里同一前缀/同一组的集中度替代也行）
 def global_confidence(global_rank, img_paths, topn=20):
     names = [os.path.basename(str(img_paths[i])) for i in global_rank[:topn]]
@@ -873,14 +1001,15 @@ def main():
 
         geom_best = 0.0
         for q_desc, q_xy in zip(q_desc_list, q_xy_list):
-            s = geom_score_adaptive(
+            s = geom_score_compatible(
                 q_desc, q_xy, c_desc, c_xy,
                 margin=MARGIN, min_keep=MIN_KEEP,
                 bin_size=BIN_SIZE, topM=TOPM, topk_core=TOPK_CORE,
                 periodic_peak_thr=PERIODIC_PEAK_THR,
                 periodic_cover_topM_thr=PERIODIC_COVER_TOPM_THR,
                 periodic_cover_xy_thr=PERIODIC_COVER_XY_THR,
-                dbg=False
+                tex_topk_core=128, tex_min_pairs=12,
+                tex_weight=0.35
             )
             if s > geom_best:
                 geom_best = s
