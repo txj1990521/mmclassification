@@ -1,7 +1,7 @@
 # dataset settings
 dataset_type = 'ImageNet'
-data_root = r'D:/zhanlan/data/'
-ann_file=r'D:/zhanlan/ann/train_with_label.txt'
+data_root = r'D:/zhanlan/new_data/'
+ann_file=r'D:/zhanlan/newData/ann/new_data_ann.txt'
 data_preprocessor = dict(
     type='SelfSupDataPreprocessor',
     mean=[123.675, 116.28, 103.53],
