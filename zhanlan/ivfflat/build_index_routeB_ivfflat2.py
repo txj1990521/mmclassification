@@ -38,13 +38,13 @@ from mmpretrain.registry import MODELS
 # =========================
 # CONFIG: 只改这里
 # =========================
-CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
+CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_build_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-DATA_ROOT = r"D:\zhanlan\data"
+DATA_ROOT = r"D:\zhanlan\new_data"
 
 # ----- outputs -----
-OUT_DIR = r"D:\zhanlan\faiss_database_hybrid"
+OUT_DIR = r"D:\zhanlan\faiss_database_hybrid_new_data"
 GLOBAL_INDEX = os.path.join(OUT_DIR, "global.index")
 GLOBAL_META  = os.path.join(OUT_DIR, "global_img_paths.npy")
 
