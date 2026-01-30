@@ -10,14 +10,27 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, List
-import halcon as ha
 from mmengine.config import Config
 from mmengine.runner import load_checkpoint
 from mmpretrain.registry import MODELS
 from rembg import remove, new_session
 import multiprocessing as mp
+from mmdet.apis import DetInferencer
+from zhanlan.utils.seg_cropper import SegMaskCropper
+from pycocotools import mask as maskUtils
+import time
+
+
 mp.set_start_method("spawn", force=True)
 
+
+# ========== SEG CONFIG ==========
+SEG_MODEL_CONFIG = r"D:/zhanlanProject/mmdetection/zhanlan/configs/mask_rcnn/mask-rcnn_r50_fpn_1x_coco.py"
+SEG_WEIGHTS      = r"D:/zhanlanProject/mmdetection/work_dirs/mask-rcnn_r50_fpn_1x_coco/epoch_12.pth"
+SEG_DEVICE       = "cuda:0"  # or "cpu"
+
+SEG_SCORE_THR    = 0.6       # 推理阈值
+SEG_USE_CLASSES  = None      # 例如 [0,1,2] 只保留这些label；None 表示不筛
 # ---------- Rerank ----------
 FEAT_LEVEL = -2
 RMAC_INPUT_SHORT = 512
@@ -64,10 +77,6 @@ RRF_K = 60
 GEOM_TOPN = 200        # 只在 RRF 后 topN 上跑
 MIN_INLIERS = 8        # RANSAC 最少内点
 RANSAC_THRESH = 5.0
-import numpy as np
-import torch
-import torch.nn.functional as F
-
 # ---------- rerank config ----------
 FEAT_LEVEL = -2
 RMAC_INPUT_SIZE = 512
@@ -90,6 +99,364 @@ def pad_to_square(img_rgb: np.ndarray):
     left = (size - w) // 2
     right = size - w - left
     return cv2.copyMakeBorder(img_rgb, top, bottom, left, right, cv2.BORDER_REFLECT101)
+
+_SEG_INFER = None
+def get_seg_inferencer():
+    global _SEG_INFER
+    if _SEG_INFER is None:
+        _SEG_INFER = DetInferencer(
+            model=SEG_MODEL_CONFIG,
+            weights=SEG_WEIGHTS,
+            device=SEG_DEVICE,
+            palette="random",
+        )
+    return _SEG_INFER
+# 0) 新增：给 head 用的“干净图”（不 feather，不 mean 背景）
+# 放在 cand_gate_score 上面/附近即可
+# =========================
+def make_head_view(img_bgr: np.ndarray, prefer_gray=True):
+    """
+    给 stripe_grid_head_v21 用：尽量保留纹理方向，不要 feather/mean 背景干扰。
+    - 如果你想更强：可以把 blur 去掉或改弱（在 stripe_grid_head_v21 内部）
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return img_bgr
+    # 只用于 head：取中间区域，避开样卡上下边/LOGO/手
+    H, W = img_bgr.shape[:2]
+    y1 = int(H * 0.15)
+    y2 = int(H * 0.85)
+    x1 = int(W * 0.10)
+    x2 = int(W * 0.90)
+    crop = img_bgr[y1:y2, x1:x2].copy()
+    return crop
+
+
+def _largest_cc(mask_u8: np.ndarray):
+    """mask_u8: 0/255"""
+    num, labels_cc, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if num <= 1:
+        return None
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    best_i = 1 + int(np.argmax(areas))
+    out = (labels_cc == best_i).astype(np.uint8) * 255
+    return out
+
+def _safe_pad_crop(img, x1, y1, x2, y2):
+    H, W = img.shape[:2]
+    x1 = max(0, min(W-1, int(x1)))
+    y1 = max(0, min(H-1, int(y1)))
+    x2 = max(1, min(W,   int(x2)))
+    y2 = max(1, min(H,   int(y2)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return img[y1:y2, x1:x2].copy()
+
+def _fill_background(crop_bgr, crop_mask_u8, mode="mean"):
+    """
+    mode:
+      - "mean": 背景填充为mask内像素均值（推荐，最不引入新模式）
+      - "white": 背景填白
+      - "edge": 先用原图，再把背景轻微模糊（尽量不引入强边界）
+    """
+    if crop_bgr is None or crop_mask_u8 is None:
+        return crop_bgr
+
+    m = crop_mask_u8.astype(bool)
+    if m.sum() < 10:
+        return crop_bgr
+
+    out = crop_bgr.copy()
+    if mode == "white":
+        out[~m] = (255, 255, 255)
+        return out
+
+    if mode == "edge":
+        # 背景做轻微模糊，减少“硬边框”特征
+        blur = cv2.GaussianBlur(out, (0, 0), 3)
+        out[~m] = blur[~m]
+        return out
+
+    # default: mean
+    mean_color = out[m].mean(axis=0)
+    out[~m] = mean_color
+    return out
+
+def crop_by_mmdet_mask_final(
+    img_bgr: np.ndarray,
+    pad: int = 10,
+    min_area_frac: float = 0.06,
+    score_thr: float = 0.6,
+    use_classes=None,
+    merge_all: bool = True,
+
+    # --- 新增：矫正 ---
+    do_rectify: bool = True,
+    rectify_pad: int = 10,
+    warp_border: str = "reflect",   # "reflect" | "replicate"
+
+    # --- 新增：背景处理 ---
+    bg_mode: str = "mean",          # "mean" | "white" | "edge"
+
+    debug_dir: str = None
+):
+    """
+    返回:
+      crop_bgr, crop_mask_u8
+    - crop_bgr: 已用 mask 抠图且背景已处理（不再是黑边）
+    - crop_mask_u8: 0/255, 与 crop_bgr 对齐
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return img_bgr, None
+
+    H, W = img_bgr.shape[:2]
+    infer = get_seg_inferencer()
+
+    res = infer(
+        inputs=[img_bgr],
+        pred_score_thr=float(score_thr),
+        batch_size=1,
+        show=False,
+        no_save_vis=True,
+        no_save_pred=True,
+        print_result=False,
+        out_dir=""
+    )
+
+    inst = _extract_instances_from_inferencer_result(res)
+    if inst is None:
+        return img_bgr, None
+
+    labels = inst.get("labels", None)
+    scores = inst.get("scores", None)
+    masks  = inst.get("masks", None)
+    if scores is None or masks is None:
+        return img_bgr, None
+
+    scores = np.asarray(scores, dtype=np.float32)
+    masks_bool = _decode_mmdet_masks(masks, H, W)
+    if masks_bool is None:
+        return img_bgr, None
+
+    keep = scores >= float(score_thr)
+    if labels is not None and use_classes is not None:
+        labels = np.asarray(labels)
+        keep = keep & np.isin(labels, np.asarray(use_classes))
+
+    idx = np.where(keep)[0]
+    if idx.size == 0:
+        return img_bgr, None
+
+    if not merge_all:
+        best = idx[np.argmax(scores[idx])]
+        m = masks_bool[best]
+    else:
+        m = np.any(masks_bool[idx].astype(bool), axis=0)
+
+    mask_u8 = (m.astype(np.uint8) * 255)
+
+    # --- 清理 ---
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, ker, iterations=2)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN,  ker, iterations=1)
+
+    # 最大连通域
+    mask_u8 = _largest_cc(mask_u8)
+    if mask_u8 is None:
+        return img_bgr, None
+
+    area = float((mask_u8 > 0).sum())
+    if area < float(min_area_frac) * (H * W):
+        return img_bgr, None
+
+    # --- 轮廓/最小外接旋转矩形 ---
+    ys, xs = np.where(mask_u8 > 0)
+    if ys.size < 20:
+        return img_bgr, None
+
+    if do_rectify:
+        pts = np.stack([xs, ys], axis=1).astype(np.float32)
+        rect = cv2.minAreaRect(pts)  # ((cx,cy),(w,h),angle)
+        (cx, cy), (rw, rh), ang = rect
+
+        # OpenCV 的 angle 规则：一般要把长边对齐到水平
+        if rw < rh:
+            ang = ang + 90.0
+
+        # 旋转矩阵
+        M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
+
+        borderMode = cv2.BORDER_REFLECT101 if warp_border == "reflect" else cv2.BORDER_REPLICATE
+
+        rot_img = cv2.warpAffine(img_bgr, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=borderMode)
+        rot_msk = cv2.warpAffine(mask_u8, M, (W, H), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        # 旋转后用 mask 的 tight bbox 裁切（注意：这是“mask bbox”，不是 det bbox）
+        ys2, xs2 = np.where(rot_msk > 0)
+        if ys2.size < 20:
+            return img_bgr, None
+
+        x1, x2 = xs2.min() - rectify_pad, xs2.max() + 1 + rectify_pad
+        y1, y2 = ys2.min() - rectify_pad, ys2.max() + 1 + rectify_pad
+
+        crop_img = _safe_pad_crop(rot_img, x1, y1, x2, y2)
+        crop_msk = _safe_pad_crop(rot_msk, x1, y1, x2, y2)
+    else:
+        # 不矫正：直接按 mask bbox 裁切（仍然不是 det bbox）
+        x1, x2 = xs.min() - pad, xs.max() + 1 + pad
+        y1, y2 = ys.min() - pad, ys.max() + 1 + pad
+        crop_img = _safe_pad_crop(img_bgr, x1, y1, x2, y2)
+        crop_msk = _safe_pad_crop(mask_u8, x1, y1, x2, y2)
+
+    if crop_img is None or crop_msk is None or crop_img.size == 0:
+        return img_bgr, None
+
+    # --- 关键：用 mask 做抠图，避免黑边干扰 ---
+    crop_msk_u8 = (crop_msk > 0).astype(np.uint8) * 255
+    crop_msk_bool = crop_msk_u8.astype(bool)
+
+    # 先做背景填充，再把前景保留（减少“硬边界”）
+    filled = _fill_background(crop_img, crop_msk_u8, mode=bg_mode)
+    out = filled.copy()
+    out[~crop_msk_bool] = filled[~crop_msk_bool]  # 背景
+    out[crop_msk_bool]  = crop_img[crop_msk_bool] # 前景原像素
+    tag = f"q_{int(time.time())}"
+    if debug_dir is not None:
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_mask.png"), mask_u8)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_crop_mask.png"), crop_msk_u8)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_crop_out.png"), out)
+
+    return out, crop_msk_u8
+
+
+def apply_mask_cut(
+    img_bgr: np.ndarray,
+    mask_uint8: np.ndarray,      # 0/255
+    pad: int = 10,
+    bg_mode: str = "mean",       # "mean" | "gray" | "blur"
+    feather: int = 9,            # 边缘羽化核大小，0=不羽化
+):
+    H, W = img_bgr.shape[:2]
+
+    # 1) 最大连通域后，你可以先做个 bbox 用来裁掉大黑边（可选但很有用）
+    #    注意：这不是“用bbox当结果”，只是为了减少空背景面积
+    ys, xs = np.where(mask_uint8 > 0)
+    if len(xs) == 0:
+        return img_bgr
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+    x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
+    x1 = min(W - 1, x1 + pad); y1 = min(H - 1, y1 + pad)
+
+    img_crop = img_bgr[y0:y1+1, x0:x1+1].copy()
+    m = mask_uint8[y0:y1+1, x0:x1+1].copy()
+
+    # 2) feather：把 mask 变成 0~1 的 alpha，并做一点高斯模糊
+    alpha = (m.astype(np.float32) / 255.0)
+    if feather and feather > 0:
+        k = int(feather)
+        if k % 2 == 0: k += 1
+        alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+
+    alpha3 = np.repeat(alpha[:, :, None], 3, axis=2)
+
+    # 3) 生成背景
+    if bg_mode == "mean":
+        bg_color = img_crop.reshape(-1, 3).mean(axis=0).astype(np.float32)  # BGR
+        bg = np.zeros_like(img_crop, dtype=np.float32)
+        bg[:] = bg_color
+    elif bg_mode == "gray":
+        bg = np.zeros_like(img_crop, dtype=np.float32)
+        bg[:] = (127, 127, 127)
+    elif bg_mode == "blur":
+        bg = cv2.GaussianBlur(img_crop, (0, 0), 15).astype(np.float32)
+    else:
+        raise ValueError("bg_mode must be mean/gray/blur")
+
+    fg = img_crop.astype(np.float32)
+    out = fg * alpha3 + bg * (1.0 - alpha3)
+    return out.astype(np.uint8)
+
+def _decode_mmdet_masks(masks_obj, H: int, W: int):
+    """
+    输入:
+      masks_obj 可能是：
+        1) (N,H,W) bool/uint8
+        2) list[dict] / np.ndarray(dtype=object): COCO RLE {"size":[H,W],"counts":...}
+    输出:
+      masks_bool: np.ndarray (N,H,W) bool
+      若失败返回 None
+    """
+    if masks_obj is None:
+        return None
+
+    # case1: already dense
+    if isinstance(masks_obj, np.ndarray) and masks_obj.ndim == 3:
+        m = masks_obj
+        if m.shape[1] != H or m.shape[2] != W:
+            return None
+        return m.astype(bool)
+
+    # case2: list/obj array of RLE dicts
+    if isinstance(masks_obj, (list, tuple)):
+        rles = list(masks_obj)
+    elif isinstance(masks_obj, np.ndarray) and masks_obj.dtype == object and masks_obj.ndim == 1:
+        rles = masks_obj.tolist()
+    else:
+        # some versions may store as BitmapMasks-like object with .to_ndarray()
+        if hasattr(masks_obj, "to_ndarray"):
+            m = masks_obj.to_ndarray()
+            if m.ndim == 3 and m.shape[1] == H and m.shape[2] == W:
+                return m.astype(bool)
+        return None
+
+    if len(rles) == 0:
+        return None
+
+    decoded = []
+    for rle in rles:
+        if isinstance(rle, dict) and "counts" in rle and "size" in rle:
+            # decode returns (H,W,1) or (H,W)
+            dm = maskUtils.decode(rle)
+            if dm.ndim == 3:
+                dm = dm[:, :, 0]
+            # pycocotools uses Fortran order internally, but decode result is correct spatially
+            if dm.shape[0] != H or dm.shape[1] != W:
+                # 有时 size 里是 (W,H)？少见，但这里兜底处理
+                if dm.shape[0] == W and dm.shape[1] == H:
+                    dm = dm.T
+                else:
+                    return None
+            decoded.append(dm.astype(bool))
+        else:
+            return None
+
+    return np.stack(decoded, axis=0)  # (N,H,W)
+
+def _extract_instances_from_inferencer_result(res):
+    """
+    兼容不同 mmdet/mmengine 版本输出结构，尽量拿到 instances dict：
+      instances = {"scores": ..., "labels": ..., "masks": ..., "bboxes": ...}
+    """
+    preds = res.get("predictions", None) or res.get("preds", None)
+    if preds is None:
+        return None
+
+    # batch 情况：取第一张
+    if isinstance(preds, list) and len(preds) > 0:
+        p0 = preds[0]
+    else:
+        p0 = preds
+
+    # 常见结构：p0["pred_instances"] 或 p0["instances"]
+    if isinstance(p0, dict):
+        if "pred_instances" in p0:
+            return p0["pred_instances"]
+        if "instances" in p0:
+            return p0["instances"]
+        # 有的版本直接平铺
+        if ("masks" in p0) or ("scores" in p0):
+            return p0
+    return None
 
 def stripe_grid_head_v21(img_bgr, resize_long=512, nbins=36):
     if img_bgr is None or img_bgr.size == 0:
@@ -276,99 +643,6 @@ def _get_rembg_session(model_name: str = "u2net"):
         _REMBG_SESSION = new_session(model_name)
     return _REMBG_SESSION
 
-def crop_by_rembg_u2net(
-    img_bgr: np.ndarray,
-    model_name: str = "u2net",
-    pad: int = 20,                 # bbox 外扩
-    min_area_frac: float = 0.08,   # 太小就回退
-    bg_suppress: bool = True       # 可选：去掉边缘碎片
-):
-    """
-    输入: BGR (H,W,3)
-    输出: 裁剪后的 BGR；如果不可靠则返回原图
-    """
-    if img_bgr is None or img_bgr.size == 0:
-        return img_bgr
-
-    h, w = img_bgr.shape[:2]
-
-    # rembg 期望 RGB
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-    sess = _get_rembg_session(model_name)
-
-    # remove() 返回带 alpha 的 RGBA bytes / ndarray（这里用 ndarray）
-    out = remove(img_rgb, session=sess)  # (H,W,4) RGBA, uint8
-    if out is None:
-        return img_bgr
-
-    if out.ndim == 3 and out.shape[2] == 4:
-        alpha = out[:, :, 3]
-    else:
-        # 极少数情况：拿不到 alpha 就回退
-        return img_bgr
-
-    alpha_u8 = alpha.astype(np.uint8)
-
-    # 用高分位阈值，而不是 >0
-    thr = int(np.percentile(alpha_u8, 94))  # 85~92 都可以
-    thr = max(thr, 50)  # 防止太低
-    mask = (alpha_u8 >= thr).astype(np.uint8) * 255
-
-    if bg_suppress:
-        # 去掉小噪声/孔洞
-        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker, iterations=2)
-        mask = cv2.erode(mask, ker, iterations=1)  # 关键：压掉泛滥前景
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker, iterations=1)
-
-    # 最大连通域
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num <= 1:
-        return img_bgr
-
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    best_i, best_score = -1, -1
-    for i in range(1, num):
-        x0, y0, ww, hh, area = stats[i]
-        if area < 500:
-            continue
-        comp = (labels == i)
-        mean_alpha = float(alpha_u8[comp].mean())
-        score = area * mean_alpha
-        if score > best_score:
-            best_score = score
-            best_i = i
-
-    if best_i < 0:
-        return img_bgr
-
-    x0, y0, ww, hh, area = stats[best_i]
-
-    if area < min_area_frac * (h * w):
-        return img_bgr
-
-    # bbox 外扩
-    x1 = max(0, x0 - pad)
-    y1 = max(0, y0 - pad)
-    x2 = min(w, x0 + ww + pad)
-    y2 = min(h, y0 + hh + pad)
-
-    crop = img_bgr[y1:y2, x1:x2].copy()
-    if crop.size == 0:
-        return img_bgr
-    print(f"[RMBG] alpha min/max/mean = {alpha_u8.min()}/{alpha_u8.max()}/{alpha_u8.mean():.1f}, thr={thr}")
-    print(f"[RMBG] mask fg ratio = {mask.mean() / 255:.3f}")
-
-    # 连通域统计
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    print(f"[RMBG] CC num={num - 1}, max_area={areas.max() if areas.size else 0}, img_area={h * w}")
-
-    print(f"[RMBG] best_i={best_i}, area={area}, bbox=({x1},{y1},{x2},{y2})")
-    print(f"[RMBG] crop shape={crop.shape if crop is not None else None}")
-    cv2.imwrite(os.path.join(OUT_DIR, "dbg_mask.png"), mask)
-
-    return crop
 # ============================================================
 # Utils
 # ============================================================
@@ -402,25 +676,24 @@ def set_faiss_nprobe(index, nprobe=64):
     except Exception:
         pass
 
+# 2) 改：geom_score_compatible 的默认参数（最小 diff：只改默认值）
+# 你原来 tex_weight=0.35 太低，margin/min_keep偏紧
+# =========================
 @torch.no_grad()
 def geom_score_compatible(q_desc, q_xy, c_desc, c_xy,
-                          # struct params
-                          margin=0.015, min_keep=6,
+                          margin=0.012, min_keep=5,
                           bin_size=0.05, topM=6, topk_core=64,
                           periodic_peak_thr=0.25,
                           periodic_cover_topM_thr=0.70,
                           periodic_cover_xy_thr=0.22,
-                          # texture params
                           tex_topk_core=128, tex_min_pairs=12,
-                          tex_weight=0.35):
+                          tex_weight=0.85, return_ng0=False):
     """
     返回一个最终的“几何相关”分数（兼容结构/纹理）
-    - 结构模式：用你的 geom_score_adaptive
-    - 纹理模式：用 texture_score，并乘 tex_weight 降权（避免误抬）
+    - Ng0>=min_keep：走结构 geom_score_adaptive
+    - 否则：走 texture_score（并且 tex_weight 不要太低）
     """
     Ng0 = compute_Ng0(q_desc, c_desc, margin=margin)
-
-    # 结构模式
     if Ng0 >= min_keep:
         s = geom_score_adaptive(
             q_desc, q_xy, c_desc, c_xy,
@@ -431,15 +704,15 @@ def geom_score_compatible(q_desc, q_xy, c_desc, c_xy,
             periodic_cover_xy_thr=periodic_cover_xy_thr,
             dbg=False
         )
-        return float(s)
+        return (float(s), Ng0) if return_ng0 else float(s)
 
-    # 纹理模式（降权）
     s_tex = texture_score(
         q_desc, q_xy, c_desc, c_xy,
         bin_size=bin_size, topM=topM,
         topk_core=tex_topk_core, min_pairs=tex_min_pairs
     )
-    return float(s_tex * tex_weight)
+    out = float(s_tex * tex_weight)
+    return (out, Ng0) if return_ng0 else out
 
 @torch.no_grad()
 def texture_score(q_desc, q_xy, c_desc, c_xy,
@@ -468,23 +741,27 @@ def texture_score(q_desc, q_xy, c_desc, c_xy,
     peak_ratio = float(cntf.max().item()) / float(K)
     m = min(int(topM), int(cnt.numel()))
     cover_topM = float(torch.topk(cntf, k=m).values.sum().item()) / float(K)
-
+    if peak_ratio > 0.85 and cover_topM < 0.35:
+        # 高峰但覆盖窄 → 很像“局部强纹理误匹配”
+        return 0.0
+    if core < 0.45 and peak_ratio > 0.6:
+        return 0.0
     # 纹理：更看重 cover_topM（集中在少数峰）
     return float(core * (0.35 + 0.65 * cover_topM) * (0.5 + 0.5 * peak_ratio))
 
 
 @torch.no_grad()
 def geom_score_with_stats(q_desc, q_xy, c_desc, c_xy, **kw):
-    """
-    返回:
-      score_struct: float  # 你的原 geom_score_adaptive 分数
-      stats: dict          # 纹理门控需要的统计量
-    """
-    # --- 复制你 geom_score_adaptive 的前半段，直到算出 Ng0 ---
     margin   = kw.get("margin", 0.015)
     min_keep = kw.get("min_keep", 6)
 
     sim = q_desc @ c_desc.t()
+    if sim.shape[1] < 2 or sim.shape[0] < 1:
+        return 0.0, {
+            "Ng0": 0, "min_keep": int(min_keep), "margin": float(margin),
+            "core_sim_mean": 0.0, "best_gap_mean": 0.0,
+        }
+
     topv, topi = torch.topk(sim, k=2, dim=1, largest=True)
     q_best  = topi[:, 0]
     q_bestv = topv[:, 0]
@@ -497,7 +774,6 @@ def geom_score_with_stats(q_desc, q_xy, c_desc, c_xy, **kw):
     good = mutual & ((q_bestv - q_2ndv) > margin)
     Ng0 = int(good.sum().item())
 
-    # --- 结构分数：仍然调用你的原函数（完全不改它） ---
     score_struct = geom_score_adaptive(q_desc, q_xy, c_desc, c_xy, **kw)
 
     stats = {
@@ -509,11 +785,10 @@ def geom_score_with_stats(q_desc, q_xy, c_desc, c_xy, **kw):
     }
     return score_struct, stats
 
+
 # ============================================================
 # Model
 # ============================================================
-import numpy as np
-import torch
 
 @torch.no_grad()
 def geom_score_adaptive(
@@ -521,35 +796,25 @@ def geom_score_adaptive(
     margin=0.02, min_keep=8,
     bin_size=4.0, topM=6, topk_core=64,
     periodic_peak_thr=0.22,
-    periodic_cover_topM_thr=0.70,   # 注意：这是 cover_topM 的阈值（不是空间覆盖）
-    periodic_cover_xy_thr=0.18,     # 新增：空间覆盖率阈值（推荐）
+    periodic_cover_topM_thr=0.70,
+    periodic_cover_xy_thr=0.18,
     dbg=False
 ):
-    """
-    q_desc: (Nq,D) torch float, L2
-    q_xy:   (Nq,2) torch float, 坐标建议是“同一尺度”（最好归一化到[0,1]）
-    c_desc: (Nc,D)
-    c_xy:   (Nc,2)
-
-    返回：float score
-    """
-
     sim = q_desc @ c_desc.t()  # (Nq, Nc)
+    if sim.shape[1] < 2 or sim.shape[0] < 1:
+        if dbg:
+            print("[DBG] early return: Nc<2 or Nq<1")
+        return 0.0
 
-    # 1) q->c best and 2nd best
     topv, topi = torch.topk(sim, k=2, dim=1, largest=True)
     q_best  = topi[:, 0]
     q_bestv = topv[:, 0]
     q_2ndv  = topv[:, 1]
 
-    # 2) c->q best (for mutual)
-    c_best = torch.argmax(sim, dim=0)  # (Nc,)
-
-    # 3) mutual NN
+    c_best = torch.argmax(sim, dim=0)
     idx_q = torch.arange(q_desc.shape[0], device=sim.device)
     mutual = (c_best[q_best] == idx_q)
 
-    # 4) ratio/margin test
     good = mutual & ((q_bestv - q_2ndv) > margin)
     Ng0 = int(good.sum().item())
     if Ng0 < min_keep:
@@ -559,21 +824,19 @@ def geom_score_adaptive(
 
     good_idx = torch.nonzero(good, as_tuple=False).squeeze(1)
 
-    # 5) 取 topk_core 个最强匹配
     K = min(topk_core, good_idx.numel())
     sel = torch.topk(q_bestv[good_idx], k=K, largest=True).indices
     good_idx = good_idx[sel]
 
-    mi = q_best[good_idx]   # matched candidate indices
-    qg = q_xy[good_idx]     # (Ng,2)
-    cg = c_xy[mi]           # (Ng,2)
+    mi = q_best[good_idx]
+    qg = q_xy[good_idx]
+    cg = c_xy[mi]
     Ng = int(good_idx.numel())
     if Ng < min_keep:
         if dbg:
             print(f"[DBG] early return: Ng={Ng} < min_keep={min_keep}")
         return 0.0
 
-    # ---- shape consistency: pairwise distance ratio ----
     P = min(64, Ng)
     qg2 = qg[:P]
     cg2 = cg[:P]
@@ -604,8 +867,7 @@ def geom_score_adaptive(
 
     shape_scale = float(np.exp(-ratio_std / 0.55)) * float(shape_gate)
 
-    # ---- displacement periodicity (multi-peak) ----
-    d = cg - qg  # (Ng,2) 确保 q_xy/c_xy 同坐标系，否则这里没意义
+    d = cg - qg
 
     dx_bin = torch.round(d[:, 0] / bin_size)
     dy_bin = torch.round(d[:, 1] / bin_size)
@@ -618,22 +880,15 @@ def geom_score_adaptive(
     m = min(topM, cnt.numel())
     cover_topM = float(torch.topk(cntf, k=m).values.sum().item()) / float(Ng)
 
-    # ---- spatial coverage on query side (推荐) ----
-    # 这个 cover_xy 是：匹配点在 query 上覆盖的范围（归一化后更稳）
-    # 如果你的 q_xy 是像素坐标，也可以先除以图像宽高再传入
     qx = qg[:, 0]
     qy = qg[:, 1]
     cover_x = float((qx.max() - qx.min()).item())
     cover_y = float((qy.max() - qy.min()).item())
-    cover_xy = min(cover_x, cover_y)  # 取更保守方向
+    cover_xy = min(cover_x, cover_y)
 
-    # ---- core similarity (用筛过的 good_idx) ----
     core = float(q_bestv[good_idx].mean().item())
-
-    # Ng scale
     ng_scale = float(min(1.0, Ng / 32.0))
 
-    # 周期性判别：主峰小 + 多峰集中 + 覆盖范围还小（典型周期假匹配）
     is_periodic = (
         (peak_ratio < periodic_peak_thr) and
         (cover_topM > periodic_cover_topM_thr) and
@@ -741,59 +996,24 @@ def _resize_long_edge(img_bgr, long_edge=768):
     nh, nw = max(1, int(round(h * s))), max(1, int(round(w * s)))
     return cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
 
-# def _extract_patches_grid(img_bgr, patch_sizes=(256, 384, 512), stride_ratio=0.5,
-#                           max_patches=64, border_frac=0.02):
-#     """
-#     多尺度网格切 patch，覆盖局部；返回 list[np.ndarray(BGR)]。
-#     - stride_ratio=0.5 => 重叠一半
-#     - max_patches 防止 query 太大切太多
-#     """
-#     H, W = img_bgr.shape[:2]
-#     patches = []
-#     for ps in patch_sizes:
-#         if min(H, W) < ps:
-#             continue
-#         stride = max(1, int(ps * stride_ratio))
-#         y0 = int(H * border_frac)
-#         x0 = int(W * border_frac)
-#         y1 = max(y0, H - int(H * border_frac) - ps)
-#         x1 = max(x0, W - int(W * border_frac) - ps)
-#
-#         ys = list(range(y0, y1 + 1, stride)) if y1 >= y0 else [max(0, (H-ps)//2)]
-#         xs = list(range(x0, x1 + 1, stride)) if x1 >= x0 else [max(0, (W-ps)//2)]
-#
-#         for y in ys:
-#             for x in xs:
-#                 patch = img_bgr[y:y+ps, x:x+ps]
-#                 if patch.shape[0] == ps and patch.shape[1] == ps:
-#                     patches.append(patch)
-#                 if len(patches) >= max_patches:
-#                     return patches
-#     # 兜底：至少给中心 patch
-#     if len(patches) == 0:
-#         s = min(H, W)
-#         y = (H - s) // 2
-#         x = (W - s) // 2
-#         patch = img_bgr[y:y+s, x:x+s]
-#         patches.append(patch)
-#     return patches
-#
-#
-
+def mask_cover(patch_xyxy, qmask):
+    x1,y1,x2,y2 = patch_xyxy
+    return qmask[y1:y2, x1:x2].mean() / 255.0
 
 def _extract_patches_grid(img_bgr, patch_sizes=(256,384,512), stride_ratio=0.5,
-                          max_patches=64, border_frac=0.02, roi_xyxy=None):
+                          max_patches=64, border_frac=0.02, roi_xyxy=None,
+                          return_xyxy=False):
     H, W = img_bgr.shape[:2]
     if roi_xyxy is not None:
-        x1,y1,x2,y2 = roi_xyxy
-        x1 = max(0,int(x1)); y1=max(0,int(y1)); x2=min(W,int(x2)); y2=min(H,int(y2))
+        rx1, ry1, rx2, ry2 = roi_xyxy
+        rx1 = max(0,int(rx1)); ry1=max(0,int(ry1)); rx2=min(W,int(rx2)); ry2=min(H,int(ry2))
     else:
-        x1,y1,x2,y2 = 0,0,W,H
+        rx1, ry1, rx2, ry2 = 0,0,W,H
 
-    patches = []
-    crop = img_bgr[y1:y2, x1:x2]
+    crop = img_bgr[ry1:ry2, rx1:rx2]
     HH, WW = crop.shape[:2]
 
+    patches = []
     for ps in patch_sizes:
         if min(HH, WW) < ps:
             continue
@@ -809,52 +1029,85 @@ def _extract_patches_grid(img_bgr, patch_sizes=(256,384,512), stride_ratio=0.5,
             for xx in xs:
                 patch = crop[yy:yy+ps, xx:xx+ps]
                 if patch.shape[0]==ps and patch.shape[1]==ps:
-                    patches.append(patch)
+                    if return_xyxy:
+                        x1 = rx1 + xx
+                        y1 = ry1 + yy
+                        x2 = x1 + ps
+                        y2 = y1 + ps
+                        patches.append((patch, (x1,y1,x2,y2)))
+                    else:
+                        patches.append(patch)
                 if len(patches) >= max_patches:
                     return patches
+
     if not patches:
-        patches.append(crop)
+        if return_xyxy:
+            patches.append((crop, (rx1, ry1, rx2, ry2)))
+        else:
+            patches.append(crop)
     return patches
+
 
 def get_query_patch_feats(model, mean, std, to_rgb, qimg_bgr,
                           patch_sizes=(256, 384, 512),
                           stride_ratio=0.5,
                           max_patches=64,
                           long_edge=1024,
-                          batch_size=64):
-    """
-    1) (可选)把 query 缩到一个合理长边，避免 3K 切 patch 爆炸
-    2) 多尺度网格切 patch
-    3) 每个 patch resize 到 224 -> backbone -> L2
-    return: feats_np (P,D) float32, patches_count
-    """
+                          batch_size=64,
+                          qmask=None,
+                          min_mask_cover=0.35):
     qimg = _resize_long_edge(qimg_bgr, long_edge=long_edge)
 
-    # 先在512输入上算roi（featmap坐标）
-    qx512 = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
-    qfm = extract_featmap(model, qx512, FEAT_LEVEL)  # (1,C,Hf,Wf)
-    roi_f = energy_roi_box(qfm[0], frac=0.18)  # (x1,y1,x2,y2) in featmap coords
+    # 如果传了 qmask，也同步 resize 到 qimg 尺寸
+    qmask_rs = None
+    if qmask is not None:
+        qmask_rs = cv2.resize(qmask, (qimg.shape[1], qimg.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-    # 把featmap ROI映射到512，再映射回原图
+    qx512 = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
+    qfm = extract_featmap(model, qx512, FEAT_LEVEL)
+    roi_f = energy_roi_box(qfm[0], frac=0.18)
+
     if roi_f is not None:
         _, _, Hf, Wf = qfm.shape
         x1, y1, x2, y2 = roi_f
-        x1 = x1 / (Wf - 1);
-        x2 = x2 / (Wf - 1)
-        y1 = y1 / (Hf - 1);
-        y2 = y2 / (Hf - 1)
+        x1 = x1 / (Wf - 1); x2 = x2 / (Wf - 1)
+        y1 = y1 / (Hf - 1); y2 = y2 / (Hf - 1)
         H, W = qimg.shape[:2]
         roi_xyxy = (x1 * W, y1 * H, x2 * W, y2 * H)
     else:
         roi_xyxy = None
 
-    patches = _extract_patches_grid(
-        qimg, patch_sizes=patch_sizes, stride_ratio=stride_ratio,
-        max_patches=max_patches,roi_xyxy=roi_xyxy
+    patches_with_xy = _extract_patches_grid(
+        qimg,
+        patch_sizes=patch_sizes,
+        stride_ratio=stride_ratio,
+        max_patches=max_patches,
+        roi_xyxy=roi_xyxy,
+        return_xyxy=True
     )
 
+    # ✅ 过滤：mask 覆盖率太低的 patch 丢掉
+    filtered = []
+    for patch, xyxy in patches_with_xy:
+        if qmask_rs is not None:
+            x1,y1,x2,y2 = xyxy
+            x1 = max(0, min(qmask_rs.shape[1]-1, int(x1)))
+            y1 = max(0, min(qmask_rs.shape[0]-1, int(y1)))
+            x2 = max(1, min(qmask_rs.shape[1],   int(x2)))
+            y2 = max(1, min(qmask_rs.shape[0],   int(y2)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            cover = float(qmask_rs[y1:y2, x1:x2].mean()) / 255.0
+            if cover < float(min_mask_cover):
+                continue
+        filtered.append(patch)
+
+    if not filtered:
+        # 兜底：别一个都没有
+        filtered = [p for p, _ in patches_with_xy[:1]]
+
     tensors = []
-    for p in patches:
+    for p in filtered:
         p224 = cv2.resize(p, (224, 224), interpolation=cv2.INTER_AREA)
         if to_rgb:
             p224 = cv2.cvtColor(p224, cv2.COLOR_BGR2RGB)
@@ -866,11 +1119,12 @@ def get_query_patch_feats(model, mean, std, to_rgb, qimg_bgr,
     with torch.no_grad():
         for st in range(0, len(tensors), batch_size):
             bt = torch.stack(tensors[st:st+batch_size], dim=0).to(DEVICE)
-            fv = extract_feat(model, bt)  # (b,D) already L2
+            fv = extract_feat(model, bt)
             feats_all.append(fv.cpu())
 
     feats = torch.cat(feats_all, dim=0).numpy().astype("float32")
-    return feats, len(patches)
+    return feats, len(filtered)
+
 
 # ============================================================
 # Patch aggregation → image score
@@ -911,6 +1165,20 @@ def rank_to_rrf_score(rank_list, k=60):
     return s
 
 
+def faiss_scores_from_D(index, D: np.ndarray) -> np.ndarray:
+    # 返回“越大越好”的 score
+    try:
+        mt = index.metric_type
+    except Exception:
+        mt = None
+
+    # faiss.METRIC_L2 == 1, faiss.METRIC_INNER_PRODUCT == 0（不同版本也可能有 enum）
+    if mt == faiss.METRIC_L2 or mt == 1:
+        D = D.astype(np.float32, copy=False)
+        return np.float32(1.0) / (np.float32(1.0) + D)
+    else:
+        # inner product 本来就是越大越好
+        return D
 
 def rrf_fuse(rankA, rankB, k=60):
     score = {}
@@ -981,6 +1249,8 @@ def _fit_square(img_bgr, tile=320):
 @torch.no_grad()
 def compute_Ng0(q_desc, c_desc, margin=0.015):
     sim = q_desc @ c_desc.t()                      # (Nq, Nc)
+    if sim.shape[1] < 2 or sim.shape[0] < 1:
+        return 0
     topv, topi = torch.topk(sim, k=2, dim=1)       # q->c top1/top2
     q_best  = topi[:, 0]
     q_bestv = topv[:, 0]
@@ -1058,24 +1328,34 @@ def clean_rank(rank_list):
         out.append(x)
     return out
 
-def cand_gate_score(cimg_bgr, q_is_grid_or_stripe: bool):
-    if not q_is_grid_or_stripe:
-        return 1.0
+# 1) 改：cand_gate_score -> 连续 gate（不再依赖 q_is）
+# 最小 diff：保持函数名不变，但增加 q_head 传入；main 里改调用
+# =========================
+def cand_gate_score(cimg_bgr, q_head: dict):
+    ch = stripe_grid_head_v21(make_head_view(cimg_bgr, prefer_gray=False))
 
-    h = stripe_grid_head_v21(cimg_bgr)
-    s = max(h["stripe_score"], h["grid_score"])
+    # peakedness 降权：避免“吊牌/边缘”把 sim 抬高
+    wP = 0.25
+    qs = np.array([q_head["stripe_score"], q_head["grid_score"],
+                   wP * np.clip(q_head["ori_peakedness"]/6.0, 0.0, 1.0)], np.float32)
+    cs = np.array([ch["stripe_score"], ch["grid_score"],
+                   wP * np.clip(ch["ori_peakedness"]/6.0, 0.0, 1.0)], np.float32)
 
-    # 非条纹：强压（解决亮片/噪声纹理混进来）
-    if s < 0.08:
-        return 0.55
-    # 弱条纹：轻压
-    if s < 0.14:
-        return 0.80
-    # 明确条纹/格子：轻微加成
-    if s > 0.22:
-        return 1.05
-    return 1.0
+    den = float(np.linalg.norm(qs) * np.linalg.norm(cs) + 1e-6)
+    sim = float((qs * cs).sum() / den)
+    sim = max(0.0, min(1.0, sim))
 
+    # sim 阈值可以略抬高一点（你现在 0.18 很松）
+    if sim < 0.28:
+        return 0.0
+
+    # “类型一致性”这两条保留
+    if q_head["grid_score"] > 0.15 and ch["grid_score"] < 0.06:
+        return 0.0
+    if q_head["stripe_score"] > 0.15 and ch["stripe_score"] < 0.06:
+        return 0.0
+
+    return float(0.60 + 0.55 * sim)
 
 # ============================================================
 # Main
@@ -1096,34 +1376,46 @@ def main():
 
     qimg = imread_unicode(QUERY_IMG)
 
-    # 这里做一次 rembg 裁剪
-    qimg = crop_by_rembg_u2net(qimg, model_name="u2net", pad=20, min_area_frac=0.08)
-    # # 调试用：看裁剪后的 query 到底长啥样
-    # cv2.imwrite(os.path.join(OUT_DIR, "dbg_crop.png"), qimg)
+    qimg, qmask = crop_by_mmdet_mask_final(
+        qimg,
+        score_thr=SEG_SCORE_THR,
+        use_classes=SEG_USE_CLASSES,
+        merge_all=True,
+        do_rectify=True,
+        warp_border="reflect",
+        bg_mode="mean",
+        debug_dir=OUT_DIR
+    )
 
-    q_head = stripe_grid_head_v21(qimg)
-    is_stripe_like = (q_head["stripe_score"] > 0.25)
-    is_grid_like = (q_head["grid_score"] > 0.17)
+    # # 调试用：看裁剪后的 query 到底长啥样
+    cv2.imwrite(os.path.join(OUT_DIR, "dbg_crop.png"), qimg)
+
+    q_head_img = make_head_view(qimg, prefer_gray=True)
+    q_head = stripe_grid_head_v21(q_head_img)
+    is_stripe_like = (q_head["stripe_score"] > 0.12)
+    is_grid_like = (q_head["grid_score"] > 0.08)
     q_is = (is_stripe_like or is_grid_like)
 
     print(
-        f"[HEADv2.1] stripe={q_head['stripe_score']:.3f} grid={q_head['grid_score']:.3f} peaked={q_head['ori_peakedness']:.2f}")
-
+        f"[HEADv2.1] stripe={q_head['stripe_score']:.3f} "
+        f"grid={q_head['grid_score']:.3f} peaked={q_head['ori_peakedness']:.2f}"
+    )
     qvec = get_query_global_feat(model, mean, std, to_rgb, qimg)
 
     # -------- Global search
     _, gids = g_index.search(qvec, TOPG)
-    global_rank = gids[0].tolist()
-
     # -------- Patch search (FIXED)
     q_patch_vecs, n_qpatch = get_query_patch_feats(
         model, mean, std, to_rgb, qimg,
-        patch_sizes=(256, 384, 512),  # 你可以先用这三个尺度
+        patch_sizes=(256, 384, 512),
         stride_ratio=0.5,
         max_patches=64,
-        long_edge=1024,  # query 很大就缩一下再切
-        batch_size=64
+        long_edge=1024,
+        batch_size=64,
+        qmask=qmask,  # ✅ 新增
+        min_mask_cover=0.22  # ✅ 可调：0.25~0.45
     )
+
     print(f"[PATCH] query patches = {n_qpatch}, vecs shape = {q_patch_vecs.shape}")
 
     def show_ids(ids, img_paths, title, n=15):
@@ -1131,21 +1423,19 @@ def main():
         for k, i in enumerate(ids[:n], 1):
             p = str(img_paths[i])
             print(f"{k:02d}  id={i:<5d}  name={os.path.basename(p)}  path={p}")
-
-
-
     # 对每个 query patch 去搜 patch index
     patch_ids_all, patch_scores_all = [], []
     D, I = p_index.search(q_patch_vecs, PATCH_TOPK_PER_QPATCH)  # D/I: (P, K)
     # D: (P,K) 对每个 query patch 内部做归一化，避免某个 patch 分值尺度异常
     D = D.astype(np.float32)
+    S = faiss_scores_from_D(p_index, D)
 
     # 聚合所有 patch hit
     patch_ids_all = I.reshape(-1).tolist()
-    patch_scores_all = D.reshape(-1).tolist()
+    patch_scores_all = S.reshape(-1).tolist()
 
     patch_rank = aggregate_patch_hits(
-        patch_ids_all, patch_scores_all, patch_meta, top_images=TOP_PATCH_IMAGES
+        patch_ids_all, patch_scores_all, patch_meta, top_images=TOP_PATCH_IMAGES,tau=0.15
     )
     global_rank = clean_rank(gids[0].tolist())
     patch_rank = clean_rank(patch_rank)
@@ -1153,15 +1443,10 @@ def main():
     print("[GLOBAL] top global-rank ids:", global_rank[:10])
 
     # -------- RRF fusion
-
     fused = rrf_fuse(global_rank, patch_rank, RRF_K)
     fused = clean_rank(fused)[:GEOM_TOPN]
-
-
-
     rrf_g = rank_to_rrf_score(global_rank, k=RRF_K)
     rrf_p = rank_to_rrf_score(patch_rank, k=RRF_K)
-
     conf_g = global_confidence(global_rank, img_paths, topn=20)
     # conf_g 越大，越信global
     w_g = 0.6 + 0.35 * conf_g  # 大概落在[0.6, 0.95]
@@ -1190,36 +1475,52 @@ def main():
     show_ids(global_rank, img_paths, "GLOBAL top")
     show_ids(patch_rank, img_paths, "PATCH  top")
     show_ids(fused, img_paths, "FUSED  top")
-    # -------- Deep geom rerank (replace ORB)
-    qx = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
-    q_fm = extract_featmap(model, qx, FEAT_LEVEL)
-    q_desc, q_xy = select_query_patches(q_fm)  # 你旧脚本里那套 ROI+full 混合即可
+    cimg_cache = {}
 
     scored = []
+    fused2 = []
+    for img_id in fused:
+        cimg0 = imread_unicode(img_paths[img_id])
+        if cimg0 is None or cimg0.size == 0:
+            continue
+        g0 = cand_gate_score(cimg0, q_head)
+        if g0 <= 0.0:
+            continue
+        fused2.append(img_id)
+    print("[FUSED] before:", len(fused), "after head gate:", len(fused2))
 
-
+    fused = fused2
     for img_id in fused:
         cimg = imread_unicode(img_paths[img_id])
-        if cimg is None:
+        if cimg is None or cimg.size == 0:
             continue
+        # ✅ candidate 不分割：直接缓存原图
+        cimg_cache[img_id] = cimg
+
         cx = make_single_tensor_for_rerank(cimg, mean, std, to_rgb=to_rgb).to(DEVICE)
         c_fm = extract_featmap(model, cx, FEAT_LEVEL)
         c_desc, c_xy = select_candidate_patches(c_fm)
 
         geom_best = 0.0
+        cnt = 0
         for q_desc, q_xy in zip(q_desc_list, q_xy_list):
-            s = geom_score_compatible(
+            s, ng0= geom_score_compatible(
                 q_desc, q_xy, c_desc, c_xy,
-                margin=MARGIN, min_keep=MIN_KEEP,
+                margin=0.012, min_keep=5,  # ✅ 放宽 Ng0 通道
                 bin_size=BIN_SIZE, topM=TOPM, topk_core=TOPK_CORE,
                 periodic_peak_thr=PERIODIC_PEAK_THR,
                 periodic_cover_topM_thr=PERIODIC_COVER_TOPM_THR,
                 periodic_cover_xy_thr=PERIODIC_COVER_XY_THR,
                 tex_topk_core=128, tex_min_pairs=12,
-                tex_weight=0.35
+                tex_weight=0.85 , # ✅ 提高 texture 权重,
+                return_ng0=True
             )
-            if s > geom_best:
-                geom_best = s
+            if q_head["grid_score"] > 0.10 and ng0 < 5:
+                s = 0.0
+            if s > 0:
+                geom_best += s
+                cnt += 1
+        geom_best = geom_best / max(1, cnt)
         scored.append((img_id, geom_best))
     scored = [(i, s) for (i, s) in scored if s > 0]
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -1231,7 +1532,7 @@ def main():
     def norm_g(g):
         return (g - gmin) / (gmax - gmin + 1e-9)
 
-    beta = 0.3  # 0.1~0.5 之间先试
+    beta = 0.15  # 0.1~0.5 之间先试
 
     final = []
     for img_id, gs in scored:
@@ -1243,10 +1544,14 @@ def main():
 
     final2 = []
     for img_id, fs, gs in final:
-        cimg = imread_unicode(img_paths[img_id])
+        cimg = cimg_cache.get(img_id, None)
         if cimg is None:
-            continue
-        g = cand_gate_score(cimg, q_is)
+            cimg = imread_unicode(img_paths[img_id])
+            if cimg is None or cimg.size == 0:
+                continue
+            cimg_cache[img_id] = cimg
+
+        g = cand_gate_score(cimg, q_head)
         final2.append((img_id, fs * g, gs))
 
     final2.sort(key=lambda x: x[1], reverse=True)

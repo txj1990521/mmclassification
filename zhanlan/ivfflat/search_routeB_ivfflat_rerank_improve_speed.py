@@ -30,12 +30,12 @@ from torch.cuda.amp import autocast
 # ============================================================
 # CONFIG (your paths)
 # ============================================================
-CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
+CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_build_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\S8987B2-90#a.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\微信图片_20260128110352_32_7.jpg"
 
-INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
+INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid_new_data"
 GLOBAL_INDEX = os.path.join(INDEX_DIR, "global.index")
 PATCH_INDEX  = os.path.join(INDEX_DIR, "patch.index")
 GLOBAL_META  = os.path.join(INDEX_DIR, "global_img_paths.npy")
@@ -129,6 +129,105 @@ def pad_to_square(img_rgb: np.ndarray):
     left = (size - w) // 2
     right = size - w - left
     return cv2.copyMakeBorder(img_rgb, top, bottom, left, right, cv2.BORDER_REFLECT101)
+
+@torch.no_grad()
+def crop_by_feat_energy(
+    model,
+    img_bgr: np.ndarray,
+    mean, std,
+    to_rgb: bool,
+    prefer_level: int = -2,
+    input_size: int = 512,         # 和 RMAC_INPUT_SIZE 一致
+    top_frac: float = 0.20,        # 取能量 top 20% 做mask，0.15~0.30可调
+    border_frac: float = 0.06,     # 去掉边缘一圈，防止背景贴边干扰
+    min_area_frac: float = 0.15,   # 最大连通域面积太小则回退
+    pad_px: int = 16,              # bbox 外扩像素
+    morph_ks: int = 11,            # mask 形态学核大小
+):
+    """
+    返回：裁剪后的 BGR 图（基于 pad_to_square 后的坐标裁剪）
+    - 如果裁剪不可靠，会回退返回原图
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return img_bgr
+
+    # 1) pad to square（在原分辨率上做）
+    img_sq = pad_to_square(img_bgr)
+    Hs, Ws = img_sq.shape[:2]
+    S = max(Hs, Ws)  # square size
+
+    # 2) 做一份 512 输入，跑 backbone featmap
+    img_in = cv2.resize(img_sq, (input_size, input_size), interpolation=cv2.INTER_LINEAR)
+    x = make_single_tensor_for_rerank(img_in, mean, std, to_rgb=to_rgb).to(DEVICE)  # (1,3,512,512)
+    fm = extract_featmap(model, x, prefer_level)  # (1,C,Hf,Wf)
+    if fm is None:
+        return img_bgr
+
+    # 3) energy map -> upsample to 512
+    e = fm[0].pow(2).sum(dim=0, keepdim=True).unsqueeze(0)  # (1,1,Hf,Wf)
+    e = F.interpolate(e, size=(input_size, input_size), mode="bilinear", align_corners=False)[0, 0]
+    e = e - e.min()
+    e = e / (e.max() + 1e-6)
+    e_np = e.detach().float().cpu().numpy()
+
+    # 4) 边缘抑制（防止背景贴边）
+    b = int(round(input_size * border_frac))
+    if b > 0:
+        e_np[:b, :] *= 0.2
+        e_np[-b:, :] *= 0.2
+        e_np[:, :b] *= 0.2
+        e_np[:, -b:] *= 0.2
+
+    # 5) top_frac 阈值二值化（只在非零区域上取分位数更稳）
+    flat = e_np.reshape(-1)
+    thr = np.quantile(flat, 1.0 - float(top_frac))
+    mask = (e_np >= thr).astype(np.uint8) * 255
+
+    # 6) 形态学，让区域更连贯
+    k = max(3, int(morph_ks) | 1)
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  ker, iterations=1)
+
+    # 7) 最大连通域 bbox
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num <= 1:
+        return img_bgr
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    i = 1 + int(np.argmax(areas))
+    x0, y0, ww, hh, area = stats[i]
+
+    # 8) 回退保护：最大区域太小 -> 不裁
+    if area < min_area_frac * (input_size * input_size):
+        return img_bgr
+
+    # 9) bbox 外扩 + 映射回 square 原图坐标
+    x1 = max(0, x0 - pad_px)
+    y1 = max(0, y0 - pad_px)
+    x2 = min(input_size, x0 + ww + pad_px)
+    y2 = min(input_size, y0 + hh + pad_px)
+
+    # 512坐标 -> img_sq坐标
+    scale = float(S) / float(input_size)
+    X1 = int(round(x1 * scale))
+    Y1 = int(round(y1 * scale))
+    X2 = int(round(x2 * scale))
+    Y2 = int(round(y2 * scale))
+
+    X1 = max(0, min(S - 2, X1))
+    Y1 = max(0, min(S - 2, Y1))
+    X2 = max(X1 + 2, min(S, X2))
+    Y2 = max(Y1 + 2, min(S, Y2))
+
+    crop = img_sq[Y1:Y2, X1:X2].copy()
+
+    # 再加一道保护：裁剪结果过小就回退
+    if crop.shape[0] * crop.shape[1] < 0.12 * (S * S):
+        return img_bgr
+
+    return crop
+
 
 def set_faiss_nprobe(index, nprobe=64):
     try:
@@ -756,9 +855,19 @@ def main():
 
     # Read query
     qimg = imread_unicode(QUERY_IMG)
+
     if qimg is None:
         raise FileNotFoundError(f"Query image not found: {QUERY_IMG}")
-
+    qimg = crop_by_feat_energy(
+        model, qimg, mean, std, to_rgb,
+        prefer_level=FEAT_LEVEL,
+        input_size=RMAC_INPUT_SIZE,
+        top_frac=0.20,
+        border_frac=0.06,
+        min_area_frac=0.15,
+        pad_px=18,
+        morph_ks=11
+    )
     # -------- Global search
     qvec = get_query_global_feat(model, mean, std, to_rgb, qimg)  # (1,D)
     _, gids = g_index.search(qvec, TOPG)

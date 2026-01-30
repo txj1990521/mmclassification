@@ -10,7 +10,7 @@ from PyQt5 import QtCore, QtWidgets
 import pyqtgraph as pg
 
 # 注意：run_retrieval 现在返回 (result_path, top_items)
-from retrieval_pipeline import run_retrieval
+from retrieval_fast import run_retrieval
 
 
 def imread_unicode(path: str):

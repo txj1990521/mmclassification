@@ -37,7 +37,7 @@ TOPM = 6
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\S8987B2-90#a.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\20260127160225_24_7.jpg"
 
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
@@ -46,7 +46,7 @@ PATCH_INDEX  = os.path.join(INDEX_DIR, "patch.index")
 GLOBAL_META  = os.path.join(INDEX_DIR, "global_img_paths.npy")
 PATCH_META   = os.path.join(INDEX_DIR, "patch_meta.npy")
 
-OUT_DIR = r"D:\zhanlan\search_vis"
+OUT_DIR = r"D:\zhanlan\search_vis2"
 TOPK = 12
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

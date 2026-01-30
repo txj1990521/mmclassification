@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 import faiss
 
+from zhanlan.utils.seg_cropper import SegMaskCropper
+
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
@@ -23,7 +25,7 @@ from mmpretrain.registry import MODELS
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\111a.jpg"
+QUERY_IMG = r"D:\zhanlan\search_vis\dbg_cut.png"
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
 GLOBAL_INDEX = os.path.join(INDEX_DIR, "global.index")
