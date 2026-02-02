@@ -74,7 +74,7 @@ TOP_PATCH_IMAGES = 4000
 RRF_K = 60
 
 # ---------- geom rerank ----------
-GEOM_TOPN = 200        # 只在 RRF 后 topN 上跑
+GEOM_TOPN = 120        # 只在 RRF 后 topN 上跑
 MIN_INLIERS = 8        # RANSAC 最少内点
 RANSAC_THRESH = 5.0
 # ---------- rerank config ----------
@@ -325,7 +325,7 @@ def crop_by_mmdet_mask_final(
         cv2.imwrite(os.path.join(debug_dir, f"{tag}_crop_mask.png"), crop_msk_u8)
         cv2.imwrite(os.path.join(debug_dir, f"{tag}_crop_out.png"), out)
 
-    return out, crop_msk_u8
+    return out, crop_msk_u8, crop_img
 
 
 def apply_mask_cut(
@@ -458,6 +458,24 @@ def _extract_instances_from_inferencer_result(res):
             return p0
     return None
 
+def fft_peak_mass(gray, resize=512, topk_frac=0.002):
+    h,w = gray.shape[:2]
+    s = resize / float(max(h,w))
+    if s < 1.0:
+        gray = cv2.resize(gray,(int(w*s),int(h*s)),interpolation=cv2.INTER_AREA)
+    g = gray.astype(np.float32); g -= g.mean()
+    F = np.fft.fftshift(np.fft.fft2(g))
+    mag = np.abs(F)
+    H,W = mag.shape; cy,cx = H//2,W//2
+    r0 = int(min(H,W)*0.03)
+    mag[cy-r0:cy+r0+1, cx-r0:cx+r0+1] = 0
+
+    flat = mag.reshape(-1)
+    K = int(topk_frac * flat.size)
+    K = max(50, min(K, 4000))
+    topk = np.partition(flat, -K)[-K:]
+    return float(topk.sum() / (flat.sum() + 1e-6))
+
 def stripe_grid_head_v21(img_bgr, resize_long=512, nbins=36):
     if img_bgr is None or img_bgr.size == 0:
         return {"stripe_score":0.0, "grid_score":0.0, "ori_peakedness":0.0}
@@ -470,7 +488,9 @@ def stripe_grid_head_v21(img_bgr, resize_long=512, nbins=36):
         img = img_bgr
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
+    # 更适合条纹：轻微锐化/高通，避免 blur 吃掉细条纹
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
 
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -480,7 +500,7 @@ def stripe_grid_head_v21(img_bgr, resize_long=512, nbins=36):
     ang = np.mod(ang, np.pi)
 
     # ✅ A：阈值更低，保留弱方向
-    thr = np.percentile(mag, 55)   # 50~60
+    thr = np.percentile(mag, 50)   # 50~60
     mask = mag > thr
     if mask.sum() < 200:
         return {"stripe_score":0.0, "grid_score":0.0, "ori_peakedness":0.0}
@@ -494,6 +514,16 @@ def stripe_grid_head_v21(img_bgr, resize_long=512, nbins=36):
 
     eps = 1e-6
     p = hist / (hist.sum() + eps)
+
+    # stripe_grid_head_v21() 里 hist/p 算完后，加：
+    bin_angles = (np.arange(nbins) + 0.5) / nbins * np.pi
+    # 离 0、pi/2 最近的距离
+    d0 = np.minimum(np.abs(bin_angles - 0), np.pi - np.abs(bin_angles - 0))
+    d90 = np.abs(bin_angles - (np.pi / 2))
+    d = np.minimum(d0, d90)
+    # 轴对齐权重：越靠近 0/90 越大
+    w = np.exp(-(d ** 2) / (2 * (0.18 ** 2))).astype(np.float32)  # 0.18 可调
+    axis_align = float((p * w).sum())  # 0~1
 
     peaked = float(p.max() / (p.mean() + eps))
 
@@ -522,7 +552,34 @@ def stripe_grid_head_v21(img_bgr, resize_long=512, nbins=36):
     grid_score = (0.65*peak1 + 0.35*peak2) * ortho * (peaked / 6.0)
     grid_score = float(np.clip(grid_score, 0.0, 1.0))
 
-    return {"stripe_score":stripe_score, "grid_score":grid_score, "ori_peakedness":peaked}
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 新增：主频半径（周期尺度）
+    r_peak = fft_peak_radius(gray, resize=512)
+    fft_h = fft_stripe_grid_head(gray)
+    # 取 topK 峰能量占比：越高越像周期纹理
+    flat = mag.flatten()
+    K = int(0.002 * flat.size)  # 0.2% 的点
+    K = max(50, min(K, 2000))
+    topk = np.partition(flat, -K)[-K:]
+
+    peak_mass = fft_peak_mass(gray, resize=512)
+
+
+    stripe_score = max(stripe_score, fft_h["stripe_score"])
+    grid_score = max(grid_score, fft_h["grid_score"])
+
+    # 算一个简单的 edge 覆盖率
+    mag_full = np.sqrt(gx * gx + gy * gy)
+    thr2 = np.percentile(mag_full, 80)
+    edge_density = float((mag_full > thr2).mean())  # 0~1
+
+    # 如果 edge_density 太低，基本是“吊牌/盒子/纯底”
+    if edge_density < 0.035:
+        stripe_score *= 0.3
+        grid_score *= 0.3
+    return {"stripe_score": stripe_score, "grid_score": grid_score, "ori_peakedness": peaked,
+            "axis_align": axis_align, "r_peak": r_peak,
+            "peak1": peak1, "peak2": peak2, "ortho": float(ortho),"peak_mass": peak_mass}
 
 @torch.no_grad()
 def make_single_tensor_for_rerank(img_bgr: np.ndarray, mean, std, to_rgb: bool):
@@ -1164,6 +1221,11 @@ def rank_to_rrf_score(rank_list, k=60):
         s[i] = 1.0 / (k + r)
     return s
 
+def is_grid_like(h):
+    if h["grid_score"] < 0.12: return False
+    if h.get("ortho", 0.0) < 0.55: return False
+    if h.get("peak2", 0.0) < 0.035: return False
+    return True
 
 def faiss_scores_from_D(index, D: np.ndarray) -> np.ndarray:
     # 返回“越大越好”的 score
@@ -1272,6 +1334,7 @@ def global_confidence(global_rank, img_paths, topn=20):
     from collections import Counter
     c = Counter(prefix).most_common(1)[0][1]
     return c / max(1, len(prefix))
+
 def visualize_grid(query_bgr, top_imgs_bgr, top_scores, out_path,
                    tile=320, gap=10, header=44):
     """
@@ -1313,6 +1376,42 @@ def visualize_grid(query_bgr, top_imgs_bgr, top_scores, out_path,
     cv2.imwrite(out_path, canvas)
     return out_path
 
+
+def fft_stripe_grid_head(gray, resize=512):
+    h, w = gray.shape[:2]
+    s = resize / float(max(h, w))
+    if s < 1.0:
+        gray = cv2.resize(gray, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+
+    gray = gray.astype(np.float32)
+    gray -= gray.mean()
+    gray = cv2.GaussianBlur(gray, (0,0), 1.0)
+
+    # FFT magnitude
+    F = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.log1p(np.abs(F))
+
+    H, W = mag.shape
+    cy, cx = H//2, W//2
+
+    # 抹掉 DC 附近一小块
+    r = int(min(H, W) * 0.03)
+    mag[cy-r:cy+r+1, cx-r:cx+r+1] = 0
+
+    # 统计“水平/垂直频带”能量：竖条 => 在水平频率轴上更明显；横条 => 在垂直频率轴上更明显
+    band = int(min(H, W) * 0.04)
+    horiz = mag[cy-band:cy+band+1, :].mean()   # 水平带
+    vert  = mag[:, cx-band:cx+band+1].mean()   # 垂直带
+    allm  = mag.mean() + 1e-6
+
+    stripe = float(max(horiz, vert) / allm)
+    grid   = float(min(horiz, vert) / allm)
+
+    # 压到 0~1（经验 mapping，你可按数据再调）
+    stripe_score = float(np.clip((stripe - 1.05) / 0.6, 0, 1))
+    grid_score   = float(np.clip((grid   - 1.02) / 0.6, 0, 1))
+    return {"stripe_score": stripe_score, "grid_score": grid_score}
+
 def clean_rank(rank_list):
     seen = set()
     out = []
@@ -1328,34 +1427,107 @@ def clean_rank(rank_list):
         out.append(x)
     return out
 
+def fft_peak_radius(gray, resize=512):
+    h,w = gray.shape[:2]
+    s = resize / float(max(h,w))
+    if s < 1.0:
+        gray = cv2.resize(gray,(int(w*s),int(h*s)),interpolation=cv2.INTER_AREA)
+
+    gray = gray.astype(np.float32); gray -= gray.mean()
+    F = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.abs(F)
+    H,W = mag.shape
+    cy,cx = H//2, W//2
+    r0 = int(min(H,W)*0.03)
+    mag[cy-r0:cy+r0+1, cx-r0:cx+r0+1] = 0
+
+    y,x = np.unravel_index(np.argmax(mag), mag.shape)
+    r = np.sqrt((y-cy)**2 + (x-cx)**2)
+
+    # ✅关键：归一化到 0~1（以 Nyquist 半径≈0.5*min(H,W) 做尺度）
+    r_norm = r / (0.5 * min(H, W) + 1e-6)
+    return float(r_norm)
+
+
 # 1) 改：cand_gate_score -> 连续 gate（不再依赖 q_is）
 # 最小 diff：保持函数名不变，但增加 q_head 传入；main 里改调用
 # =========================
-def cand_gate_score(cimg_bgr, q_head: dict):
+def cand_gate_score(cimg_bgr, q_head: dict, return_dbg=False):
     ch = stripe_grid_head_v21(make_head_view(cimg_bgr, prefer_gray=False))
-
-    # peakedness 降权：避免“吊牌/边缘”把 sim 抬高
+    # 1) 类别硬门：query 是格子 => candidate 必须格子
+    q_is_grid = (q_head["grid_score"] > 0.18)  # 你这次 q_head.grid=0.735，肯定为 True
+    if q_is_grid and (not is_grid_like(ch)):
+        if return_dbg:
+            return 0.0, "not_grid", 0.0, ch
+        return 0.0
     wP = 0.25
     qs = np.array([q_head["stripe_score"], q_head["grid_score"],
                    wP * np.clip(q_head["ori_peakedness"]/6.0, 0.0, 1.0)], np.float32)
     cs = np.array([ch["stripe_score"], ch["grid_score"],
                    wP * np.clip(ch["ori_peakedness"]/6.0, 0.0, 1.0)], np.float32)
 
-    den = float(np.linalg.norm(qs) * np.linalg.norm(cs) + 1e-6)
-    sim = float((qs * cs).sum() / den)
-    sim = max(0.0, min(1.0, sim))
+    qsn = float(np.linalg.norm(qs))
+    csn = float(np.linalg.norm(cs))
 
-    # sim 阈值可以略抬高一点（你现在 0.18 很松）
+    # head 太“平”，cosine 会虚高 → 直接当作不相似
+    if csn < 0.06:
+        sim = 0.0
+    else:
+        sim = float((qs * cs).sum() / (qsn * csn + 1e-6))
+        sim = max(0.0, min(1.0, sim))
+
+    # -------- init --------
+    g = 0.0
+    reason = "init"
+    plaid_penalty = 1.0   # 必须先初始化，避免 UnboundLocalError
+
+    # 1) plaid 一致性：分强弱
+    if q_head["grid_score"] > 0.18:
+        if not is_grid_like(ch):
+            return 0.0
+        plaid_penalty = 1.0  # strict 通过也明确赋值
+    elif q_head["grid_score"] > 0.10:
+        # 弱 plaid：软惩罚
+        if ch["grid_score"] < 0.02:
+            plaid_penalty = 0.45
+        else:
+            plaid_penalty = 1.0
+    else:
+        plaid_penalty = 1.0
+
+    # 2) stripe 一致性（硬门）
+    if q_head["stripe_score"] > 0.15 and ch["stripe_score"] < 0.08:
+        reason = "stripe_miss"
+        if return_dbg:
+            return g, reason, sim, ch
+        return g
+
+    # 3) sim 门槛
     if sim < 0.28:
-        return 0.0
+        reason = "sim_low"
+        if return_dbg:
+            return g, reason, sim, ch
+        return g
 
-    # “类型一致性”这两条保留
-    if q_head["grid_score"] > 0.15 and ch["grid_score"] < 0.06:
-        return 0.0
-    if q_head["stripe_score"] > 0.15 and ch["stripe_score"] < 0.06:
-        return 0.0
+    # 4) peakedness 惩罚（软门）
+    peak_penalty = 1.0
+    if q_head["ori_peakedness"] > 5.5 and ch["ori_peakedness"] < 3.8:
+        peak_penalty = 0.4
 
-    return float(0.60 + 0.55 * sim)
+
+    scale_penalty = 1.0
+    if "r_peak" in q_head and "r_peak" in ch:
+        ratio = ch["r_peak"] / (q_head["r_peak"] + 1e-6)
+        if ratio < 0.70 or ratio > 1.45:
+            scale_penalty = 0.6  # 只降权，不直接踢掉
+
+    g = float((0.60 + 0.55 * sim) * peak_penalty * plaid_penalty * scale_penalty)
+
+    reason = "pass"
+
+    if return_dbg:
+        return g, reason, sim, ch
+    return g
 
 # ============================================================
 # Main
@@ -1376,7 +1548,7 @@ def main():
 
     qimg = imread_unicode(QUERY_IMG)
 
-    qimg, qmask = crop_by_mmdet_mask_final(
+    qimg, qmask, qimg_raw = crop_by_mmdet_mask_final(
         qimg,
         score_thr=SEG_SCORE_THR,
         use_classes=SEG_USE_CLASSES,
@@ -1390,16 +1562,19 @@ def main():
     # # 调试用：看裁剪后的 query 到底长啥样
     cv2.imwrite(os.path.join(OUT_DIR, "dbg_crop.png"), qimg)
 
-    q_head_img = make_head_view(qimg, prefer_gray=True)
+    q_head_img = make_head_view(qimg_raw, prefer_gray=True)
     q_head = stripe_grid_head_v21(q_head_img)
-    is_stripe_like = (q_head["stripe_score"] > 0.12)
-    is_grid_like = (q_head["grid_score"] > 0.08)
-    q_is = (is_stripe_like or is_grid_like)
+    q_is_stripe_like  = (q_head["stripe_score"] > 0.12)
+    q_is_grid_like  = (q_head["grid_score"] > 0.08)
+
 
     print(
         f"[HEADv2.1] stripe={q_head['stripe_score']:.3f} "
         f"grid={q_head['grid_score']:.3f} peaked={q_head['ori_peakedness']:.2f}"
     )
+    print(f"[Q] axis_align={q_head.get('axis_align', 0):.3f} r_peak={q_head.get('r_peak', 0):.1f}")
+
+
     qvec = get_query_global_feat(model, mean, std, to_rgb, qimg)
 
     # -------- Global search
@@ -1451,7 +1626,7 @@ def main():
     # conf_g 越大，越信global
     w_g = 0.6 + 0.35 * conf_g  # 大概落在[0.6, 0.95]
     w_p = 1.0 - w_g
-    if is_stripe_like or is_grid_like:
+    if q_is_stripe_like  or q_is_grid_like:
         # 强制偏向 patch_rank（条纹库）
         w_g = 0.20
         w_p = 0.80
@@ -1479,22 +1654,35 @@ def main():
 
     scored = []
     fused2 = []
+
+    fail_cnt = {"plaid_miss": 0, "stripe_miss": 0, "sim_low": 0}
+    shown = 0
+
     for img_id in fused:
         cimg0 = imread_unicode(img_paths[img_id])
         if cimg0 is None or cimg0.size == 0:
             continue
-        g0 = cand_gate_score(cimg0, q_head)
-        if g0 <= 0.0:
+        g0, reason, sim, ch = cand_gate_score(cimg0, q_head, return_dbg=True)
+        print("rp_q", q_head.get("r_peak"), "rp_c", ch.get("r_peak"))
+        if g0 <= 0:
+            fail_cnt[reason] = fail_cnt.get(reason, 0) + 1
+            if shown < 20:
+                print(f"[FAIL] id={img_id} reason={reason} sim={sim:.3f} "
+                      f"ch_s={ch['stripe_score']:.3f} ch_g={ch['grid_score']:.3f} ch_p={ch['ori_peakedness']:.2f} "
+                      f"name={os.path.basename(str(img_paths[img_id]))}")
+                shown += 1
             continue
         fused2.append(img_id)
+    print("[HEADGATE FAIL STAT]", fail_cnt)
     print("[FUSED] before:", len(fused), "after head gate:", len(fused2))
+    print(f"... axis_align={ch.get('axis_align', 0):.3f} ...")
 
     fused = fused2
     for img_id in fused:
         cimg = imread_unicode(img_paths[img_id])
         if cimg is None or cimg.size == 0:
             continue
-        # ✅ candidate 不分割：直接缓存原图
+        # candidate 不分割：直接缓存原图
         cimg_cache[img_id] = cimg
 
         cx = make_single_tensor_for_rerank(cimg, mean, std, to_rgb=to_rgb).to(DEVICE)
@@ -1532,7 +1720,7 @@ def main():
     def norm_g(g):
         return (g - gmin) / (gmax - gmin + 1e-9)
 
-    beta = 0.15  # 0.1~0.5 之间先试
+    beta = 0.6  # 0.1~0.5 之间先试
 
     final = []
     for img_id, gs in scored:
@@ -1551,11 +1739,33 @@ def main():
                 continue
             cimg_cache[img_id] = cimg
 
-        g = cand_gate_score(cimg, q_head)
-        final2.append((img_id, fs * g, gs))
+        g, reason, sim, ch = cand_gate_score(cimg, q_head, return_dbg=True)
+        # fail_cnt[reason] = fail_cnt.get(reason, 0) + 1
+        if g > 0:
+            print(f"[PASS] id={img_id} g={g:.3f} sim={sim:.3f} reason={reason} "
+                  f"ch_s={ch['stripe_score']:.3f} ch_g={ch['grid_score']:.3f} ch_p={ch['ori_peakedness']:.2f} "
+                  f"name={os.path.basename(str(img_paths[img_id]))}")
+            final2.append((img_id, fs * (0.75 + 0.25 * g), gs))
+        else:
+            # 只看前20个失败原因也行，避免刷屏
+            pass
+
+
 
     final2.sort(key=lambda x: x[1], reverse=True)
     final = final2
+    if len(final) == 0:
+        print("[WARN] final is empty after rerank/gate. fallback to fused (or global/patch) topk.")
+        # fallback：直接用 fused2(空) 不行，所以用 fused(原始) 或 patch_rank/global_rank
+        fallback_ids = clean_rank(fused)[:TOPK]  # fused 还是原来的 200（没gate之前）
+        top = [(i, 1.0 - r / (len(fallback_ids) + 1e-9), 0.0) for r, i in enumerate(fallback_ids)]
+        # 直接走可视化/打印
+        imgs = [imread_unicode(img_paths[i]) for i, _, _ in top]
+        scores = [s for _, s, _ in top]
+        out = os.path.join(OUT_DIR, "result_grid1.png")
+        visualize_grid(qimg, imgs, scores, out, tile=320)
+        print("Saved:", out)
+        return
 
     scores = [fs for _, fs, _ in final]
     s_min = min(scores)
@@ -1567,9 +1777,19 @@ def main():
         final_norm.append((img_id, fs_norm, gs))
 
     final_norm.sort(key=lambda x: x[1], reverse=True)
-    top = final_norm[:TOPK]
 
-    # top = final[:TOPK]
+    top_grid = []
+    for img_id, fs, gs in final_norm:
+        ch = stripe_grid_head_v21(make_head_view(cimg_cache[img_id], prefer_gray=False))
+        if is_grid_like(ch):
+            top_grid.append((img_id, fs, gs))
+        if len(top_grid) >= TOPK:
+            break
+
+    if len(top_grid) >= TOPK:
+        top = top_grid
+    else:
+        top = final_norm[:TOPK]
 
     for r, (img_id, fs, gs) in enumerate(top, 1):
         print(f"{r:02d}  final={fs:.4f}  geom={gs:.4f}  {img_paths[img_id]}")
