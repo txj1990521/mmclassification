@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import hashlib
+import random
 from matplotlib import pyplot as plt
 from mmengine.config import Config
 from mmengine.runner import load_checkpoint
@@ -31,7 +32,7 @@ from mmpretrain.registry import MODELS
 from rembg import remove, new_session
 from pycocotools import mask as maskUtils
 from ultralytics import YOLO
-
+from hybrid_shared import gen_patch_windows_unified, patch_to_model_input, STRIPE_LONG_EDGE
 # mp
 mp.set_start_method("spawn", force=True)
 
@@ -56,7 +57,7 @@ YOLO_SEG_WEIGHTS = r"D:\zhanlanProject\ultralyticsV8\runs\huaxing\exp12\weights\
 _YOLO_SEG = None
 
 # ---------- query / index ----------
-QUERY_IMG = r"D:\zhanlan\qurrey_data\4.5 TL05027.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\4.5 TL05027.JPG"
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid_new_data"
 GLOBAL_INDEX = os.path.join(INDEX_DIR, "global.index")
@@ -78,7 +79,6 @@ TOPK = 12
 # STRIPE_SHARED_CONSTANTS
 # =========================
 STRIPE_AR_THR = 2.7
-STRIPE_LONG_EDGE = 1536
 
 STRIPE_WIN_H = 224
 STRIPE_STRIDE = 48
@@ -101,6 +101,18 @@ RRF_K = 60
 GEOM_TOPN = 120
 MIN_INLIERS = 8
 RANSAC_THRESH = 5.0
+
+VIEWS_PER_IMAGE = 12
+RESIZE_SHORT = 256
+CROP_SIZE = 224
+VIEW_PLAN = [
+    (0,   1, 5),
+    (-15, 1, 1),
+    (15,  1, 1),
+    (-30, 1, 0),
+    (30,  1, 0),
+]
+VIEW_BATCH = 256  # batch in "views"
 
 # ---------- patch rerank / feature-map patches ----------
 FEAT_LEVEL = -2
@@ -248,20 +260,20 @@ def _yolo_extract_mask_u8(result, H, W, conf_thr=0.6, use_classes=None, merge_al
     return mm
 
 def crop_by_mmdet_mask_final(
-    img_bgr: np.ndarray,
-    pad: int = 10,
-    min_area_frac: float = 0.06,
-    score_thr: float = 0.6,
-    use_classes=None,
-    merge_all: bool = True,
-    do_rectify: bool = True,
-    rectify_pad: int = 10,
-    warp_border: str = "reflect",   # "reflect" | "replicate"
-    bg_mode: str = "mean",          # "mean" | "white" | "edge"
-    debug_dir: str = None,
-    yolo_imgsz: int = 640,
-    yolo_iou: float = 0.5,
-    yolo_retina_masks: bool = True,
+        img_bgr: np.ndarray,
+        pad: int = 10,
+        min_area_frac: float = 0.06,
+        score_thr: float = 0.6,
+        use_classes=None,
+        merge_all: bool = True,
+        do_rectify: bool = True,
+        rectify_pad: int = 10,
+        warp_border: str = "reflect",   # "reflect" | "replicate"
+        bg_mode: str = "mean",          # "mean" | "white" | "edge"
+        debug_dir: str = None,
+        yolo_imgsz: int = 640,
+        yolo_iou: float = 0.5,
+        yolo_retina_masks: bool = True,
 ):
     if img_bgr is None or img_bgr.size == 0:
         return img_bgr, None, None
@@ -372,15 +384,15 @@ def crop_by_mmdet_mask_final(
 # 5. Stripe/Grid Head Features (FFT + Orientation Histogram)
 # ============================================================
 def aggregate_patch_hits_stripe(
-    patch_ids, patch_scores, patch_meta,
-    top_images=4000,
-    topM=10,
-    tau=0.15,
-    pos_bin=500,          # 10000/500=20 bins
-    min_cover_bins=3,     # 覆盖太少的直接惩罚
-    w_cover=0.12,         # 覆盖加成权重
-    w_cont=0.10,          # 连续性加成权重
-    only_ptype=1          # 只用 stripe patch
+        patch_ids, patch_scores, patch_meta,
+        top_images=4000,
+        topM=10,
+        tau=0.15,
+        pos_bin=500,          # 10000/500=20 bins
+        min_cover_bins=3,     # 覆盖太少的直接惩罚
+        w_cover=0.12,         # 覆盖加成权重
+        w_cont=0.10,          # 连续性加成权重
+        only_ptype=1          # 只用 stripe patch
 ):
     meta = patch_meta
     assert isinstance(meta, np.ndarray) and meta.ndim == 2 and meta.shape[1] >= 8
@@ -625,6 +637,113 @@ def is_grid_like(h: dict):
 # 6. Model Build / Feature Extraction
 # ============================================================
 @torch.no_grad()
+def extract_backbone_last(model, batch_tensor: torch.Tensor):
+    feat_map = model.backbone(batch_tensor)
+
+    if isinstance(feat_map, dict):
+        if 'feat' in feat_map:
+            feat_map = feat_map['feat']
+        elif 'features' in feat_map:
+            feat_map = feat_map['features']
+        else:
+            feat_map = list(feat_map.values())[-1]
+
+    if isinstance(feat_map, (tuple, list)):
+        feat_map = feat_map[-1]
+
+    if feat_map.dim() == 2:
+        feat = feat_map
+    else:
+        feat = feat_map.mean(dim=(2, 3))
+
+    feat = F.normalize(feat, p=2, dim=1)
+    return feat
+def power_norm_torch(x: torch.Tensor, eps: float = 1e-12):
+    return torch.sign(x) * torch.sqrt(torch.clamp(torch.abs(x), min=eps))
+
+def resize_long_edge(img_bgr: np.ndarray, max_long: int):
+    h, w = img_bgr.shape[:2]
+    s = max_long / max(h, w)
+    if s >= 1.0:
+        return img_bgr
+    nh, nw = int(round(h*s)), int(round(w*s))
+    return cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
+def center_crop(img_rgb: np.ndarray, size=224):
+    h, w = img_rgb.shape[:2]
+    if h < size or w < size:
+        scale = size / min(h, w)
+        nh, nw = int(round(h * scale)), int(round(w * scale))
+        img_rgb = cv2.resize(img_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        h, w = img_rgb.shape[:2]
+    y1 = (h - size) // 2
+    x1 = (w - size) // 2
+    return img_rgb[y1:y1+size, x1:x1+size]
+
+def random_crop(img_rgb: np.ndarray, size=224):
+    h, w = img_rgb.shape[:2]
+    if h < size or w < size:
+        scale = size / min(h, w)
+        nh, nw = int(round(h * scale)), int(round(w * scale))
+        img_rgb = cv2.resize(img_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        h, w = img_rgb.shape[:2]
+    y = random.randint(0, h - size)
+    x = random.randint(0, w - size)
+    return img_rgb[y:y+size, x:x+size]
+def to_tensor_from_rgb(img_rgb_crop: np.ndarray, mean, std):
+    x = img_rgb_crop.astype(np.float32)
+    x = (x - mean) / std
+    x = np.transpose(x, (2, 0, 1))
+    return torch.from_numpy(x)
+
+def rotate_bound(img_rgb: np.ndarray, deg: float):
+    if deg == 0:
+        return img_rgb
+    h, w = img_rgb.shape[:2]
+    cX, cY = w // 2, h // 2
+    M = cv2.getRotationMatrix2D((cX, cY), deg, 1.0)
+    cos = abs(M[0, 0]); sin = abs(M[0, 1])
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+    M[0, 2] += (nW / 2) - cX
+    M[1, 2] += (nH / 2) - cY
+    return cv2.warpAffine(img_rgb, M, (nW, nH),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REFLECT101)
+def resize_short_edge(img_rgb: np.ndarray, short=256):
+    h, w = img_rgb.shape[:2]
+    if min(h, w) == short:
+        return img_rgb
+    scale = short / min(h, w)
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+    return cv2.resize(img_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+@torch.no_grad()
+def make_views_for_global(img_bgr: np.ndarray, mean, std, to_rgb: bool):
+    if to_rgb:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    else:
+        img_rgb = img_bgr[:, :, ::-1].copy()
+    img_rgb = resize_short_edge(img_rgb, RESIZE_SHORT)
+
+    views = []
+    for deg, n_center, n_rand in VIEW_PLAN:
+        rot = rotate_bound(img_rgb, deg)
+        for _ in range(n_center):
+            views.append(to_tensor_from_rgb(center_crop(rot, CROP_SIZE), mean, std))
+        for _ in range(n_rand):
+            views.append(to_tensor_from_rgb(random_crop(rot, CROP_SIZE), mean, std))
+    return views[:VIEWS_PER_IMAGE]
+
+@torch.no_grad()
+def aggregate_views_to_one(feats_view: torch.Tensor):
+    # You used max pooling; keep consistent with your system.
+    agg = feats_view.max(dim=0).values
+    agg = power_norm_torch(agg)
+    agg = F.normalize(agg.unsqueeze(0), p=2, dim=1).squeeze(0)
+    return agg
+
+@torch.no_grad()
 def build_model(cfg_path, ckpt_path):
     cfg = Config.fromfile(cfg_path)
     model = MODELS.build(cfg.model)
@@ -637,23 +756,41 @@ def build_model(cfg_path, ckpt_path):
     to_rgb = bool(dp.get("to_rgb", True))
     return model, mean, std, to_rgb
 
-@torch.no_grad()
-def extract_feat(model, imgs):
-    feat = model.backbone(imgs)
-    if isinstance(feat, (tuple, list)):
-        feat = feat[-1]
-    if feat.dim() == 4:
-        feat = feat.mean(dim=(2, 3))
-    return F.normalize(feat, p=2, dim=1)
+# @torch.no_grad()
+# def extract_feat(model, imgs):
+#     feat = model.backbone(imgs)
+#     if isinstance(feat, (tuple, list)):
+#         feat = feat[-1]
+#     if feat.dim() == 4:
+#         feat = feat.mean(dim=(2, 3))
+#     return F.normalize(feat, p=2, dim=1)
 
-def get_query_global_feat(model, mean, std, to_rgb, img_bgr):
-    img = cv2.resize(img_bgr, (224, 224))
-    if to_rgb:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    x = (img.astype(np.float32) - mean) / std
-    x = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        return extract_feat(model, x).cpu().numpy()
+# def get_query_global_feat(model, mean, std, to_rgb, img_bgr):
+#     img = cv2.resize(img_bgr, (224, 224))
+#     if to_rgb:
+#         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+#     x = (img.astype(np.float32) - mean) / std
+#     x = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(DEVICE)
+#     with torch.no_grad():
+#         return extract_feat(model, x).cpu().numpy()
+
+def get_query_global_feat(model, mean, std, to_rgb, img_bgr, device=DEVICE):
+    # 建议：seed 用“和建库一致的输入尺度”
+    # 统一做 seed 的源图
+    seed_src = resize_long_edge(img_bgr, max_long=STRIPE_LONG_EDGE)
+    random.seed(seed_from_image(seed_src, base=0))
+
+    # views 用同一个 seed_src（或者至少同一份 resize 结果）
+    views = make_views_for_global(seed_src, mean, std, to_rgb)
+
+    if len(views) == 0:
+        raise RuntimeError("No global views generated for query.")
+
+    bt = torch.stack(views, dim=0).to(device)              # (V,3,224,224)
+    feats_v = extract_backbone_last(model, bt)             # (V,D) torch, 已 L2
+
+    q = aggregate_views_to_one(feats_v)                    # (D,) torch
+    return q.unsqueeze(0).detach().cpu().numpy().astype("float32")  # (1,D)
 
 
 # ============================================================
@@ -807,14 +944,14 @@ def select_candidate_patches(c_fm_1bchw: torch.Tensor,
 # 8. Patch Extraction for FAISS Patch Index Query
 # ============================================================
 def gen_stripe_windows(
-    H: int, W: int,
-    max_patches: int,
-    seed: int,
-    win_w: int = 192,       # “条带宽度方向”的窗口厚度（像素）
-    win_h: int = 384,       # 沿长边窗口长度（像素）
-    stride: int = None,     # 沿长边步长；None -> win_h//4
-    center_frac: float = 0.92,
-    jitter: int = 8,
+        H: int, W: int,
+        max_patches: int,
+        seed: int,
+        win_w: int = 192,       # “条带宽度方向”的窗口厚度（像素）
+        win_h: int = 384,       # 沿长边窗口长度（像素）
+        stride: int = None,     # 沿长边步长；None -> win_h//4
+        center_frac: float = 0.92,
+        jitter: int = 8,
 ):
     """
     返回 windows: list of (x1,y1,x2,y2,win,patch_type,pos_int)
@@ -908,6 +1045,12 @@ def gen_stripe_windows(
 
     return windows
 
+def seed_from_image(img_bgr: np.ndarray, base: int = 999) -> int:
+    if img_bgr is None or img_bgr.size == 0:
+        return base & 0x7fffffff
+    h = hashlib.md5(img_bgr.tobytes()).hexdigest()
+    return (int(h[:8], 16) + base) & 0x7fffffff
+
 def seed_from_path(p: str, base: int = 999) -> int:
     h = hashlib.md5(str(p).encode("utf-8")).hexdigest()
     return (int(h[:8], 16) + base) & 0x7fffffff
@@ -922,18 +1065,17 @@ def _resize_long_edge(img_bgr, long_edge=1536):
 
 @torch.no_grad()
 def get_query_patch_feats_unified(
-    model, mean, std, to_rgb, qimg_bgr,
-    qmask=None,
-    long_edge=1536,
-    stripe_ar_thr=STRIPE_AR_THR,
-    # ---- stripe params (完全对齐建库) ----
-    stripe_win_h=224,
-    stripe_stride=48,
-    stripe_max_patches=24,
-    stripe_center_frac=0.92,
-    stripe_jitter=8,
-    min_mask_cover=0.0,   # 建库没做mask过滤；要完全一致就设0
-    batch_size=64,
+        model, mean, std, to_rgb, qimg_bgr,
+        qmask=None,
+        long_edge=1536,
+        stripe_ar_thr=STRIPE_AR_THR,
+        stripe_win_h=STRIPE_WIN_H,
+        stripe_stride=STRIPE_STRIDE,
+        stripe_max_patches=STRIPE_MAX_PATCHES,
+        stripe_center_frac=STRIPE_CENTER_FRAC,
+        stripe_jitter=STRIPE_JITTER,
+        min_mask_cover=0.0,
+        batch_size=64,
 ):
     qimg = _resize_long_edge(qimg_bgr, long_edge=long_edge)
     H, W = qimg.shape[:2]
@@ -942,47 +1084,69 @@ def get_query_patch_feats_unified(
     if qmask is not None:
         qmask_rs = cv2.resize(qmask, (W, H), interpolation=cv2.INTER_NEAREST)
 
-    ar = max(W / (H + 1e-6), H / (W + 1e-6))
-    is_stripe = (ar >= stripe_ar_thr)
+    # ar = max(W / (H + 1e-6), H / (W + 1e-6))
+    # is_stripe = (ar >= stripe_ar_thr)
+    #
+    # patches = []
+    q_seed = seed_from_image(qimg, base=999)
+    qimg_resized, windows, is_stripe = gen_patch_windows_unified(
+        qimg_bgr,
+        max_long=long_edge,
+        stripe_ar_thr=stripe_ar_thr,
+        seed_base=999,
+        stripe_max_patches=stripe_max_patches,
+        stripe_win_h=stripe_win_h,
+        stripe_stride=stripe_stride,
+        stripe_center_frac=stripe_center_frac,
+        stripe_jitter=stripe_jitter,
+        grid_sizes=(256, 384, 512, 768),
+        grid_stride_ratio=0.5,
+        max_patches=60,
+    )
 
     patches = []
-    q_seed = seed_from_path(QUERY_IMG, base=999)
+    for (x1, y1, x2, y2, win, ptype, pos) in windows:
+        patch = qimg_resized[y1:y2, x1:x2]
+        patches.append(patch)
     if is_stripe:
-        # 只用一条中间带（不要三列！否则patch数直接翻倍/三倍）
         win_w = int(np.clip(STRIPE_WIN_W_FRAC * W, STRIPE_WIN_W_MIN, STRIPE_WIN_W_MAX))
         windows = gen_stripe_windows(
             H, W,
-            max_patches=STRIPE_MAX_PATCHES,
+            max_patches=stripe_max_patches,
             seed=q_seed,
             win_w=win_w,
-            win_h=STRIPE_WIN_H,
-            stride=STRIPE_STRIDE,
-            center_frac=STRIPE_CENTER_FRAC,
-            jitter=STRIPE_JITTER,
+            win_h=stripe_win_h,
+            stride=stripe_stride,
+            center_frac=stripe_center_frac,
+            jitter=stripe_jitter,
         )
 
-        # 可选：mask过滤（如果你坚持要用mask）
+        if len(windows) < min(6, stripe_max_patches):
+            ww = min(max(win_w, 160), W)
+            hh = min(max(stripe_win_h, 256), H)
+            x1 = max(0, (W - ww) // 2)
+            y1 = max(0, (H - hh) // 2)
+            windows.append((x1, y1, x1 + ww, y1 + hh, int(max(ww, hh)), 1, 5000))
+
+        # mask 过滤（要完全对齐建库就 min_mask_cover=0）
         if qmask_rs is not None and min_mask_cover > 0:
             filtered = []
             for (x1, y1, x2, y2, win, ptype, pos) in windows:
                 cover = float(qmask_rs[y1:y2, x1:x2].mean()) / 255.0
                 if cover >= min_mask_cover:
                     filtered.append((x1, y1, x2, y2, win, ptype, pos))
-            # 防止过滤后太少导致不稳定：少于16就直接不用mask过滤
             if len(filtered) >= 16:
                 windows = filtered
 
-        for (x1, y1, x2, y2, win, ptype, pos) in windows:
-            patch = qimg[y1:y2, x1:x2]
-            patches.append(patch)
+        for (x1, y1, x2, y2, *_rest) in windows:
+            patches.append(qimg[y1:y2, x1:x2])
 
     else:
-        # 非长条：保留你原来的 grid 逻辑即可（这里示例用你现有的）
         patches_with_xy = _extract_patches_grid(
             qimg,
-            patch_sizes=(256, 384, 512),
-            stride_ratio=0.35,
-            max_patches=128,
+            patch_sizes=(256, 384, 512, 768),
+            stride_ratio=0.5,
+            max_patches=60,
             roi_xyxy=None,
             return_xyxy=True
         )
@@ -996,25 +1160,25 @@ def get_query_patch_feats_unified(
     if len(patches) == 0:
         patches = [qimg]
 
-    # encode
+    # --- encode ---
     tensors = []
     for p in patches:
-        p224 = cv2.resize(p, (224, 224), interpolation=cv2.INTER_AREA)
+        p224 = cv2.resize(p, (224, 224), interpolation=cv2.INTER_LINEAR)
         if to_rgb:
             p224 = cv2.cvtColor(p224, cv2.COLOR_BGR2RGB)
         x = (p224.astype(np.float32) - mean) / std
-        tensors.append(torch.from_numpy(x.transpose(2, 0, 1)))
+        tensors.append(torch.from_numpy(x.transpose(2, 0, 1)))  # (3,224,224) CPU torch
 
-    feats_all = []
+    feats_chunks = []
     for st in range(0, len(tensors), batch_size):
         bt = torch.stack(tensors[st:st + batch_size]).to(DEVICE)
-        fv = extract_feat(model, bt)
-        feats_all.append(fv.cpu())
+        fv = extract_backbone_last(model, bt)   # (b,D) torch
+        feats_chunks.append(fv.detach().cpu())  # keep torch on CPU
 
-    feats = torch.cat(feats_all, dim=0).numpy().astype("float32")
+    feats = torch.cat(feats_chunks, dim=0).numpy().astype("float32")  # (N,D) numpy
     return feats, len(patches), bool(is_stripe), (H, W)
 
-def _extract_patches_grid(img_bgr, patch_sizes=(256, 384, 512), stride_ratio=0.5,
+def _extract_patches_grid(img_bgr, patch_sizes=(256, 384, 512,768), stride_ratio=0.5,
                           max_patches=64, border_frac=0.02, roi_xyxy=None,
                           return_xyxy=False):
     H, W = img_bgr.shape[:2]
@@ -1199,13 +1363,13 @@ def texture_score(q_desc, q_xy, c_desc, c_xy,
 
 @torch.no_grad()
 def geom_score_adaptive(
-    q_desc, q_xy, c_desc, c_xy,
-    margin=0.02, min_keep=8,
-    bin_size=4.0, topM=6, topk_core=64,
-    periodic_peak_thr=0.22,
-    periodic_cover_topM_thr=0.70,
-    periodic_cover_xy_thr=0.18,
-    dbg=False
+        q_desc, q_xy, c_desc, c_xy,
+        margin=0.02, min_keep=8,
+        bin_size=4.0, topM=6, topk_core=64,
+        periodic_peak_thr=0.22,
+        periodic_cover_topM_thr=0.70,
+        periodic_cover_xy_thr=0.18,
+        dbg=False
 ):
     sim = q_desc @ c_desc.t()
     if sim.shape[1] < 2 or sim.shape[0] < 1:
@@ -1288,9 +1452,9 @@ def geom_score_adaptive(
     ng_scale = float(min(1.0, Ng / 32.0))
 
     is_periodic = (
-        (peak_ratio < periodic_peak_thr) and
-        (cover_topM > periodic_cover_topM_thr) and
-        (cover_xy < periodic_cover_xy_thr)
+            (peak_ratio < periodic_peak_thr) and
+            (cover_topM > periodic_cover_topM_thr) and
+            (cover_xy < periodic_cover_xy_thr)
     )
 
     score = core * peak_ratio * ng_scale * shape_scale
@@ -1573,7 +1737,7 @@ def main():
     w_p = 1.0 - w_g
 
     if (q_head["stripe_score"] > 0.18 and q_head["ori_peakedness"] > 2.8) or \
-       (q_head["grid_score"]   > 0.18 and q_head["ori_peakedness"] > 2.8):
+            (q_head["grid_score"]   > 0.18 and q_head["ori_peakedness"] > 2.8):
         w_g, w_p = 0.20, 0.80
 
     final_rrf = {}
@@ -1596,6 +1760,19 @@ def main():
         if g0 > 0:
             fused2.append(img_id)
             cimg_cache[img_id] = cimg
+
+    target_id = 351
+
+    def rank_pos(lst, x):
+        try:
+            return lst.index(x) + 1
+        except:
+            return None
+
+    print("target global pos:", rank_pos(global_rank, target_id))
+    print("target patch  pos:", rank_pos(patch_rank, target_id))
+    print("target fused  pos:", rank_pos(fused, target_id))
+    print("target fused2 pos:", rank_pos(fused2, target_id))  # fused2 是 gate 后的
 
     # ---- geom rerank
     angles = [-10, -5, 0, 5, 10] if is_vertical_stripe else [-30, -15, 0, 15, 30]
@@ -1629,6 +1806,8 @@ def main():
             if s > 0:
                 geom_best += s
                 cnt += 1
+            if img_id == 351:
+                print("[T351] cnt=", cnt, "geom_best=", geom_best, "avg=", (geom_best / cnt if cnt > 0 else 0.0))
 
         if cnt > 0:
             scored.append((img_id, geom_best / cnt))
