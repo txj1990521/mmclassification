@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+import json
 import os
 import cv2
 import faiss
@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, List
+
+from matplotlib import pyplot as plt
 from mmengine.config import Config
 from mmengine.runner import load_checkpoint
 from mmpretrain.registry import MODELS
@@ -18,6 +20,7 @@ import multiprocessing as mp
 from mmdet.apis import DetInferencer
 from zhanlan.utils.seg_cropper import SegMaskCropper
 from pycocotools import mask as maskUtils
+from ultralytics import YOLO
 import time
 
 
@@ -25,8 +28,6 @@ mp.set_start_method("spawn", force=True)
 
 
 # ========== SEG CONFIG ==========
-SEG_MODEL_CONFIG = r"D:/zhanlanProject/mmdetection/zhanlan/configs/mask_rcnn/mask-rcnn_r50_fpn_1x_coco.py"
-SEG_WEIGHTS      = r"D:/zhanlanProject/mmdetection/work_dirs/mask-rcnn_r50_fpn_1x_coco/epoch_12.pth"
 SEG_DEVICE       = "cuda:0"  # or "cpu"
 
 SEG_SCORE_THR    = 0.6       # 推理阈值
@@ -46,7 +47,6 @@ PERIODIC_PEAK_THR  = 0.25
 PERIODIC_COVER_THR = 0.22
 PERIODIC_COVER_TOPM_THR = 0.70  # 新增：topM bins 覆盖占比
 PERIODIC_COVER_XY_THR   = 0.22  # 你现在这个更像空间覆盖阈值
-
 TOPM = 6
 # ============================================================
 # CONFIG
@@ -54,7 +54,11 @@ TOPM = 6
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_build_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\微信图片_20260128110352_32_7.jpg"
+
+YOLO_SEG_WEIGHTS = r"D:\zhanlanProject\ultralyticsV8\runs\huaxing\exp12\weights\best.pt"
+YOLO_DEVICE = 0  # 0 / "cpu" / "cuda:0"；ultralytics 通常用 0 表示 GPU0
+_YOLO_SEG = None
+QUERY_IMG = r"D:\zhanlan\qurrey_data\4.5 TL05027.jpg"
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid_new_data"
 GLOBAL_INDEX = os.path.join(INDEX_DIR, "global.index")
@@ -69,7 +73,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------- retrieval ----------
 TOPG = 2000
-PATCH_TOPK_PER_QPATCH = 400
+PATCH_TOPK_PER_QPATCH = 800
 TOP_PATCH_IMAGES = 4000
 RRF_K = 60
 
@@ -89,6 +93,184 @@ C_ROI_FRAC = 0.18      # candidate roi energy box fraction
 Q_ROI_RATIO = 0.50     # query: ROI patches ratio (0~1)
 C_ROI_RATIO = 1.00     # candidate: use ROI if exists, else fallback
 
+
+class SearchDebugger:
+    def __init__(self, out_dir):
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(exist_ok=True)
+        self.debug_log = []
+
+    def log(self, message, level="INFO"):
+        """记录调试信息"""
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        entry = f"[{timestamp}] [{level}] {message}"
+        self.debug_log.append(entry)
+        print(entry)
+
+    def save_debug_info(self):
+        """保存所有调试信息"""
+        log_file = self.out_dir / "search_debug.log"
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.write("\n".join(self.debug_log))
+        print(f"[DEBUG] Debug log saved to {log_file}")
+
+    def visualize_query_processing(self, img_bgr, mask=None, crop_img=None, stage=""):
+        """可视化query处理过程"""
+        fig, axes = plt.subplots(1, 3 if crop_img is not None else 2, figsize=(15, 5))
+
+        # 原始图像
+        axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        axes[0].set_title(f'Original Image {img_bgr.shape}')
+        axes[0].axis('off')
+
+        # Mask（如果有）
+        if mask is not None:
+            axes[1].imshow(mask, cmap='gray')
+            axes[1].set_title(f'Mask (coverage: {(mask > 0).mean():.2%})')
+            axes[1].axis('off')
+
+            # 裁剪后的图像（如果有）
+            if crop_img is not None:
+                axes[2].imshow(cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB))
+                axes[2].set_title(f'Cropped {crop_img.shape}')
+                axes[2].axis('off')
+        else:
+            if crop_img is not None:
+                axes[1].imshow(cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB))
+                axes[1].set_title(f'Cropped {crop_img.shape}')
+                axes[1].axis('off')
+
+        plt.suptitle(f'Query Processing - {stage}')
+        plt.tight_layout()
+        save_path = self.out_dir / f"query_{stage}.png"
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+
+        self.log(f"Query visualization saved: {save_path}")
+        return save_path
+
+    def visualize_patch_extraction(self, img_bgr, patches_info, mask=None):
+        """可视化patch提取位置"""
+        vis = img_bgr.copy()
+
+        # 绘制patch边界
+        for i, (y1, x1, y2, x2) in enumerate(patches_info[:20]):  # 只绘制前20个
+            color = (0, 255, 0)  # 绿色
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(vis, str(i), (x1 + 5, y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        # 如果有mask，叠加显示
+        if mask is not None:
+            # 创建mask半透明叠加
+            mask_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            mask_overlay = (mask_overlay * 0.3).astype(np.uint8)
+            vis = cv2.addWeighted(vis, 0.7, mask_overlay, 0.3, 0)
+
+        # 添加统计信息
+        stats_text = f"Total patches: {len(patches_info)}"
+        cv2.putText(vis, stats_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        save_path = self.out_dir / "patch_extraction.png"
+        cv2.imwrite(str(save_path), vis)
+
+        # 也保存patch网格图
+        self.save_patch_grid(img_bgr, patches_info[:36])  # 最多36个
+
+        self.log(f"Patch extraction visualization saved: {save_path}")
+        return save_path
+
+    def save_patch_grid(self, img_bgr, patches_info, grid_size=6):
+        """保存patch网格图"""
+        if not patches_info:
+            return
+
+        # 创建网格
+        fig, axes = plt.subplots(grid_size, grid_size, figsize=(15, 15))
+        axes = axes.flatten()
+
+        for idx, (y1, x1, y2, x2) in enumerate(patches_info[:len(axes)]):
+            # 边界保护（避免越界 / 负数 / 反向）
+            H, W = img_bgr.shape[:2]
+            y1 = max(0, min(H, int(y1)))
+            y2 = max(0, min(H, int(y2)))
+            x1 = max(0, min(W, int(x1)))
+            x2 = max(0, min(W, int(x2)))
+            if y2 <= y1 or x2 <= x1:
+                continue
+
+            patch = img_bgr[y1:y2, x1:x2]
+            if patch.size == 0:
+                continue
+
+            # 调整到统一大小显示
+            patch_resized = cv2.resize(patch, (100, 100))
+            axes[idx].imshow(cv2.cvtColor(patch_resized, cv2.COLOR_BGR2RGB))
+            axes[idx].set_title(f"Patch {idx}")
+            axes[idx].axis('off')
+
+        # 隐藏多余的子图
+        for idx in range(len(patches_info), len(axes)):
+            axes[idx].axis('off')
+
+        plt.suptitle("Extracted Patches (Resized to 100x100)")
+        plt.tight_layout()
+        save_path = self.out_dir / "patch_grid.png"
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+
+    def visualize_similarity_distribution(self, similarities, target_index=-1):
+        """可视化相似度分布"""
+        # 提取相似度值
+        sim_values = [s for _, s, _ in similarities]
+        indices = [i for i, _, _ in similarities]
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+        # 1. 相似度直方图
+        axes[0].hist(sim_values, bins=50, alpha=0.7, color='skyblue', edgecolor='black')
+        axes[0].axvline(x=np.mean(sim_values), color='red', linestyle='--', label=f'Mean: {np.mean(sim_values):.3f}')
+        axes[0].set_xlabel('Similarity Score')
+        axes[0].set_ylabel('Frequency')
+        axes[0].set_title('Similarity Distribution')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        # 2. 相似度排名
+        x_positions = list(range(1, min(51, len(sim_values)) + 1))
+        bars = axes[1].bar(x_positions, sim_values[:50], alpha=0.7, color='lightcoral')
+
+        # 高亮目标（如果存在）
+        if target_index in indices:
+            target_rank = indices.index(target_index) + 1
+            if target_rank <= 50:
+                bars[target_rank - 1].set_color('red')
+                axes[1].text(target_rank, sim_values[target_rank - 1],
+                             f'Target (Rank {target_rank})',
+                             ha='center', va='bottom', fontweight='bold')
+
+        axes[1].set_xlabel('Rank')
+        axes[1].set_ylabel('Similarity Score')
+        axes[1].set_title('Top 50 Similarities')
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_path = self.out_dir / "similarity_distribution.png"
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+
+        self.log(f"Similarity distribution saved: {save_path}")
+        return save_path
+
+    def record_search_metrics(self, metrics):
+        """记录搜索指标"""
+        metrics_file = self.out_dir / "search_metrics.json"
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, indent=2, ensure_ascii=False)
+        self.log(f"Search metrics saved: {metrics_file}")
+
+
 def pad_to_square(img_rgb: np.ndarray):
     h, w = img_rgb.shape[:2]
     if h == w:
@@ -100,17 +282,15 @@ def pad_to_square(img_rgb: np.ndarray):
     right = size - w - left
     return cv2.copyMakeBorder(img_rgb, top, bottom, left, right, cv2.BORDER_REFLECT101)
 
-_SEG_INFER = None
-def get_seg_inferencer():
-    global _SEG_INFER
-    if _SEG_INFER is None:
-        _SEG_INFER = DetInferencer(
-            model=SEG_MODEL_CONFIG,
-            weights=SEG_WEIGHTS,
-            device=SEG_DEVICE,
-            palette="random",
-        )
-    return _SEG_INFER
+
+
+def get_yolo_seg():
+    global _YOLO_SEG
+    if _YOLO_SEG is None:
+        _YOLO_SEG = YOLO(YOLO_SEG_WEIGHTS)
+    return _YOLO_SEG
+
+
 # 0) 新增：给 head 用的“干净图”（不 feather，不 mean 背景）
 # 放在 cand_gate_score 上面/附近即可
 # =========================
@@ -181,6 +361,61 @@ def _fill_background(crop_bgr, crop_mask_u8, mode="mean"):
     out[~m] = mean_color
     return out
 
+def _yolo_extract_mask_u8(result, H, W, conf_thr=0.6, use_classes=None, merge_all=True):
+    """
+    result: ultralytics 的单张结果 (results[0])
+    return: mask_u8 (H,W) 0/255 or None
+    """
+    if result is None:
+        return None
+
+    boxes = getattr(result, "boxes", None)
+    masks = getattr(result, "masks", None)
+
+    if masks is None or boxes is None:
+        return None
+
+    if masks.data is None or len(masks.data) == 0:
+        return None
+
+    # masks.data: (N, mh, mw) torch tensor (0/1)
+    m = masks.data
+    # boxes.conf: (N,)
+    conf = boxes.conf
+    # boxes.cls: (N,)
+    cls = boxes.cls
+
+    if conf is None:
+        conf = torch.ones((m.shape[0],), device=m.device)
+
+    keep = conf >= float(conf_thr)
+
+    if use_classes is not None and cls is not None:
+        use = torch.tensor(use_classes, device=m.device, dtype=cls.dtype)
+        keep = keep & torch.isin(cls, use)
+
+    idx = torch.where(keep)[0]
+    if idx.numel() == 0:
+        return None
+
+    m_keep = m[idx]  # (K, mh, mw)
+
+    if not merge_all:
+        # 取最高置信度那一个
+        best_local = torch.argmax(conf[idx]).item()
+        mm = m_keep[best_local]
+    else:
+        mm = torch.any(m_keep > 0.5, dim=0)  # (mh, mw)
+
+    mm = mm.float()
+
+    # YOLO mask 分辨率可能不是原图，resize 回原图 H,W
+    mm = mm.unsqueeze(0).unsqueeze(0)  # (1,1,mh,mw)
+    mm = torch.nn.functional.interpolate(mm, size=(H, W), mode="nearest")
+    mm = mm[0, 0].detach().cpu().numpy().astype(np.uint8) * 255
+
+    return mm
+
 def crop_by_mmdet_mask_final(
     img_bgr: np.ndarray,
     pad: int = 10,
@@ -188,112 +423,105 @@ def crop_by_mmdet_mask_final(
     score_thr: float = 0.6,
     use_classes=None,
     merge_all: bool = True,
-
-    # --- 新增：矫正 ---
+    # --- 矫正 ---
     do_rectify: bool = True,
     rectify_pad: int = 10,
     warp_border: str = "reflect",   # "reflect" | "replicate"
-
-    # --- 新增：背景处理 ---
+    # --- 背景处理 ---
     bg_mode: str = "mean",          # "mean" | "white" | "edge"
 
-    debug_dir: str = None
+    debug_dir: str = None,
+
+    # --- YOLO 推理参数（可按你 predict 那套习惯调）---
+    yolo_imgsz: int = 640,
+    yolo_iou: float = 0.5,
+    yolo_retina_masks: bool = True,
 ):
     """
     返回:
-      crop_bgr, crop_mask_u8
-    - crop_bgr: 已用 mask 抠图且背景已处理（不再是黑边）
-    - crop_mask_u8: 0/255, 与 crop_bgr 对齐
+      out_bgr, crop_mask_u8, crop_img_raw
+    - out_bgr: 已用 mask 抠图且背景已处理（不再是黑边）
+    - crop_mask_u8: 0/255, 与 out_bgr 对齐
+    - crop_img_raw: 纯裁剪图（没填背景前）
     """
     if img_bgr is None or img_bgr.size == 0:
-        return img_bgr, None
+        return img_bgr, None, None
 
     H, W = img_bgr.shape[:2]
-    infer = get_seg_inferencer()
+    default_mask = np.ones((H, W), dtype=np.uint8) * 255
+    default_raw = img_bgr
 
-    res = infer(
-        inputs=[img_bgr],
-        pred_score_thr=float(score_thr),
-        batch_size=1,
-        show=False,
-        no_save_vis=True,
-        no_save_pred=True,
-        print_result=False,
-        out_dir=""
+    # ========== 1) YOLO seg 推理 ==========
+    model = get_yolo_seg()
+
+    # ultralytics 直接传 ndarray(BGR) 也能跑；内部会处理
+    # 注意：device 用 0 / "cpu"；不要用 "cuda:0" 那种字符串（不同版本兼容性不一）
+    results = model.predict(
+        source=img_bgr,
+        conf=float(score_thr),
+        iou=float(yolo_iou),
+        imgsz=int(yolo_imgsz),
+        device=YOLO_DEVICE,
+        max_det=100,
+        retina_masks=bool(yolo_retina_masks),
+        classes=use_classes,   # ultralytics 原生支持
+        verbose=False,
+        stream=False,
+        save=False,
+        show=False
     )
 
-    inst = _extract_instances_from_inferencer_result(res)
-    if inst is None:
-        return img_bgr, None
+    if results is None or len(results) == 0:
+        return img_bgr, default_mask, default_raw
 
-    labels = inst.get("labels", None)
-    scores = inst.get("scores", None)
-    masks  = inst.get("masks", None)
-    if scores is None or masks is None:
-        return img_bgr, None
+    r0 = results[0]
+    mask_u8 = _yolo_extract_mask_u8(
+        r0, H, W,
+        conf_thr=float(score_thr),
+        use_classes=use_classes,
+        merge_all=merge_all
+    )
 
-    scores = np.asarray(scores, dtype=np.float32)
-    masks_bool = _decode_mmdet_masks(masks, H, W)
-    if masks_bool is None:
-        return img_bgr, None
+    if mask_u8 is None:
+        return img_bgr, default_mask, default_raw
 
-    keep = scores >= float(score_thr)
-    if labels is not None and use_classes is not None:
-        labels = np.asarray(labels)
-        keep = keep & np.isin(labels, np.asarray(use_classes))
-
-    idx = np.where(keep)[0]
-    if idx.size == 0:
-        return img_bgr, None
-
-    if not merge_all:
-        best = idx[np.argmax(scores[idx])]
-        m = masks_bool[best]
-    else:
-        m = np.any(masks_bool[idx].astype(bool), axis=0)
-
-    mask_u8 = (m.astype(np.uint8) * 255)
-
-    # --- 清理 ---
+    # ========== 2) 清理 mask（保持你原逻辑） ==========
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, ker, iterations=2)
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN,  ker, iterations=1)
 
-    # 最大连通域
     mask_u8 = _largest_cc(mask_u8)
     if mask_u8 is None:
-        return img_bgr, None
+        return img_bgr, default_mask, default_raw
 
     area = float((mask_u8 > 0).sum())
     if area < float(min_area_frac) * (H * W):
-        return img_bgr, None
+        return img_bgr, default_mask, default_raw
 
-    # --- 轮廓/最小外接旋转矩形 ---
     ys, xs = np.where(mask_u8 > 0)
     if ys.size < 20:
-        return img_bgr, None
+        return img_bgr, default_mask, default_raw
 
+    # ========== 3) 旋转矫正 + 裁剪 ==========
     if do_rectify:
         pts = np.stack([xs, ys], axis=1).astype(np.float32)
         rect = cv2.minAreaRect(pts)  # ((cx,cy),(w,h),angle)
         (cx, cy), (rw, rh), ang = rect
 
-        # OpenCV 的 angle 规则：一般要把长边对齐到水平
         if rw < rh:
             ang = ang + 90.0
 
-        # 旋转矩阵
         M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
 
         borderMode = cv2.BORDER_REFLECT101 if warp_border == "reflect" else cv2.BORDER_REPLICATE
 
         rot_img = cv2.warpAffine(img_bgr, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=borderMode)
-        rot_msk = cv2.warpAffine(mask_u8, M, (W, H), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        rot_msk = cv2.warpAffine(mask_u8, M, (W, H), flags=cv2.INTER_NEAREST,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-        # 旋转后用 mask 的 tight bbox 裁切（注意：这是“mask bbox”，不是 det bbox）
         ys2, xs2 = np.where(rot_msk > 0)
         if ys2.size < 20:
-            return img_bgr, None
+            return img_bgr, default_mask, default_raw
 
         x1, x2 = xs2.min() - rectify_pad, xs2.max() + 1 + rectify_pad
         y1, y2 = ys2.min() - rectify_pad, ys2.max() + 1 + rectify_pad
@@ -301,32 +529,30 @@ def crop_by_mmdet_mask_final(
         crop_img = _safe_pad_crop(rot_img, x1, y1, x2, y2)
         crop_msk = _safe_pad_crop(rot_msk, x1, y1, x2, y2)
     else:
-        # 不矫正：直接按 mask bbox 裁切（仍然不是 det bbox）
         x1, x2 = xs.min() - pad, xs.max() + 1 + pad
         y1, y2 = ys.min() - pad, ys.max() + 1 + pad
         crop_img = _safe_pad_crop(img_bgr, x1, y1, x2, y2)
         crop_msk = _safe_pad_crop(mask_u8, x1, y1, x2, y2)
 
     if crop_img is None or crop_msk is None or crop_img.size == 0:
-        return img_bgr, None
+        return img_bgr, default_mask, default_raw
 
-    # --- 关键：用 mask 做抠图，避免黑边干扰 ---
+    # ========== 4) 背景填充 + 输出 ==========
     crop_msk_u8 = (crop_msk > 0).astype(np.uint8) * 255
     crop_msk_bool = crop_msk_u8.astype(bool)
 
-    # 先做背景填充，再把前景保留（减少“硬边界”）
     filled = _fill_background(crop_img, crop_msk_u8, mode=bg_mode)
     out = filled.copy()
-    out[~crop_msk_bool] = filled[~crop_msk_bool]  # 背景
-    out[crop_msk_bool]  = crop_img[crop_msk_bool] # 前景原像素
+    out[crop_msk_bool] = crop_img[crop_msk_bool]
+
     tag = f"q_{int(time.time())}"
     if debug_dir is not None:
         cv2.imwrite(os.path.join(debug_dir, f"{tag}_mask.png"), mask_u8)
         cv2.imwrite(os.path.join(debug_dir, f"{tag}_crop_mask.png"), crop_msk_u8)
+        cv2.imwrite(os.path.join(debug_dir, f"{tag}_crop_raw.png"), crop_img)
         cv2.imwrite(os.path.join(debug_dir, f"{tag}_crop_out.png"), out)
 
     return out, crop_msk_u8, crop_img
-
 
 def apply_mask_cut(
     img_bgr: np.ndarray,
@@ -556,18 +782,9 @@ def stripe_grid_head_v21(img_bgr, resize_long=512, nbins=36):
     # 新增：主频半径（周期尺度）
     r_peak = fft_peak_radius(gray, resize=512)
     fft_h = fft_stripe_grid_head(gray)
-    # 取 topK 峰能量占比：越高越像周期纹理
-    flat = mag.flatten()
-    K = int(0.002 * flat.size)  # 0.2% 的点
-    K = max(50, min(K, 2000))
-    topk = np.partition(flat, -K)[-K:]
-
     peak_mass = fft_peak_mass(gray, resize=512)
-
-
     stripe_score = max(stripe_score, fft_h["stripe_score"])
     grid_score = max(grid_score, fft_h["grid_score"])
-
     # 算一个简单的 edge 覆盖率
     mag_full = np.sqrt(gx * gx + gy * gy)
     thr2 = np.percentile(mag_full, 80)
@@ -1045,6 +1262,104 @@ def get_query_global_feat(model, mean, std, to_rgb, img_bgr):
 # ============================================================
 # Query patch embedding (FIX PATCH SEARCH BUG)
 # ============================================================
+def get_query_patch_feats_for_vertical_stripe(
+        model, mean, std, to_rgb, qimg_bgr,
+        long_edge=1024,
+        patch_width=224,  # 固定宽度
+        patch_height=224,  # 固定高度
+        stride_ratio=0.3,  # 更密集的采样
+        max_patches=256,
+        qmask=None,
+        min_mask_cover=0.02  # 极低门槛
+):
+    """专门为竖向长条图设计的patch提取"""
+    # 保持长宽比缩放
+    H, W = qimg_bgr.shape[:2]
+    scale = long_edge / float(H)  # 按高度缩放
+    new_h = long_edge
+    new_w = max(1, int(W * scale))
+
+    qimg = cv2.resize(qimg_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # mask同步缩放
+    if qmask is not None:
+        qmask = cv2.resize(qmask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    # 计算采样位置
+    patches = []
+    new_H, new_W = new_h, new_w
+
+    # 沿高度方向滑动窗口
+    stride = int(patch_height * stride_ratio)
+
+    # 在宽度方向采样多个位置，而不是仅中心
+    width_positions = []
+    center_x = new_W // 2
+
+    # 生成多个宽度位置
+    if new_W > patch_width * 3:
+        # 宽图：左、中、右
+        width_positions = [0, center_x - patch_width // 2, new_W - patch_width]
+    else:
+        # 窄图：中心
+        width_positions = [max(0, center_x - patch_width // 2)]
+
+    # 过滤无效位置
+    width_positions = [x for x in width_positions if 0 <= x <= new_W - patch_width]
+    if not width_positions:
+        width_positions = [max(0, new_W - patch_width)]
+
+    for start_x in width_positions:
+        y = 0
+        while y + patch_height <= new_H and len(patches) < max_patches:
+            # 轻微随机扰动
+            x_offset = np.random.randint(-8, 9) if new_W - start_x - patch_width > 16 else 0
+            current_x = max(0, min(new_W - patch_width, start_x + x_offset))
+
+            patch = qimg[y:y + patch_height, current_x:current_x + patch_width]
+
+            # mask检查（极宽松）
+            if qmask is not None:
+                mask_patch = qmask[y:y + patch_height, current_x:current_x + patch_width]
+                cover = mask_patch.mean() / 255.0
+                if cover < min_mask_cover:
+                    # 即使mask覆盖低也保留，但要标记
+                    pass
+
+            patches.append(patch)
+            y += stride
+
+    # 兜底：确保至少有一些patch
+    if len(patches) == 0:
+        # 取中间区域
+        center_y = new_H // 2 - patch_height // 2
+        center_x = new_W // 2 - patch_width // 2
+        center_y = max(0, center_y)
+        center_x = max(0, center_x)
+        patch = qimg[center_y:center_y + patch_height, center_x:center_x + patch_width]
+        patches.append(patch)
+
+    # 特征提取（保持原有代码）
+    tensors = []
+    for p in patches:
+        p224 = cv2.resize(p, (224, 224), interpolation=cv2.INTER_AREA)
+        if to_rgb:
+            p224 = cv2.cvtColor(p224, cv2.COLOR_BGR2RGB)
+        x = (p224.astype(np.float32) - mean) / std
+        x = torch.from_numpy(x.transpose(2, 0, 1))
+        tensors.append(x)
+
+    feats_all = []
+    batch_size = 64
+    for st in range(0, len(tensors), batch_size):
+        bt = torch.stack(tensors[st:st + batch_size]).to(DEVICE)
+        fv = extract_feat(model, bt)
+        feats_all.append(fv.cpu())
+
+    feats = torch.cat(feats_all, dim=0).numpy().astype("float32")
+    print(f"[VERTICAL STRIPE] extracted {len(patches)} patches from {new_W}x{new_H} image")
+    return feats, len(patches)
+
 def _resize_long_edge(img_bgr, long_edge=768):
     h, w = img_bgr.shape[:2]
     s = long_edge / float(max(h, w))
@@ -1105,66 +1420,159 @@ def _extract_patches_grid(img_bgr, patch_sizes=(256,384,512), stride_ratio=0.5,
     return patches
 
 
-def get_query_patch_feats(model, mean, std, to_rgb, qimg_bgr,
-                          patch_sizes=(256, 384, 512),
-                          stride_ratio=0.5,
-                          max_patches=64,
-                          long_edge=1024,
-                          batch_size=64,
-                          qmask=None,
-                          min_mask_cover=0.35):
+@torch.no_grad()
+def get_query_patch_feats(
+    model,
+    mean,
+    std,
+    to_rgb,
+    qimg_bgr,
+    patch_sizes=(256, 384, 512),     # 非条形时用
+    stride_ratio=0.5,
+    max_patches=256,
+    long_edge=1024,
+    batch_size=64,
+    qmask=None,                      # 0/255
+    min_mask_cover=0.10
+):
+    """
+    条形专用 patch 抽取：
+    - 条形：固定宽度，沿长边滑窗
+    - 非条形：原方形网格
+    返回：
+      feats: (N,2048)
+      N
+    """
+    rng = np.random.default_rng(123)
+    # ===============================
+    # 1. resize（保持比例）
+    # ===============================
     qimg = _resize_long_edge(qimg_bgr, long_edge=long_edge)
+    H, W = qimg.shape[:2]
 
-    # 如果传了 qmask，也同步 resize 到 qimg 尺寸
+    # mask 同步 resize
     qmask_rs = None
     if qmask is not None:
-        qmask_rs = cv2.resize(qmask, (qimg.shape[1], qimg.shape[0]), interpolation=cv2.INTER_NEAREST)
+        qmask_rs = cv2.resize(qmask, (W, H), interpolation=cv2.INTER_NEAREST)
 
-    qx512 = make_single_tensor_for_rerank(qimg, mean, std, to_rgb=to_rgb).to(DEVICE)
-    qfm = extract_featmap(model, qx512, FEAT_LEVEL)
-    roi_f = energy_roi_box(qfm[0], frac=0.18)
+    # ===============================
+    # 2. 判断是否条形
+    # ===============================
+    ar = max(W / (H + 1e-6), H / (W + 1e-6))
+    is_stripe = ar >= 2.5   # 2.5~4.0 都可以，3 是比较稳的
 
-    if roi_f is not None:
-        _, _, Hf, Wf = qfm.shape
-        x1, y1, x2, y2 = roi_f
-        x1 = x1 / (Wf - 1); x2 = x2 / (Wf - 1)
-        y1 = y1 / (Hf - 1); y2 = y2 / (Hf - 1)
-        H, W = qimg.shape[:2]
-        roi_xyxy = (x1 * W, y1 * H, x2 * W, y2 * H)
+    # 条形 → mask 覆盖率阈值自动放宽
+    if is_stripe:
+        max_patches = 256
+        if ar > 4:
+            min_mask_cover = 0.02
+        elif ar > 3:
+            min_mask_cover = 0.03
+        else:
+            min_mask_cover = 0.05
+
+    # ===============================
+    # 3. 抽取 patches
+    # ===============================
+    patches = []
+
+    if is_stripe:
+        # ===== 条形：沿长边滑窗 =====
+        vertical = (H >= W)
+
+        # 窗口参数（可按你数据微调）
+        win_w = min(192, W)            # 覆盖条带宽度
+        win_h = min(384, H if vertical else W)
+        stride = max(32, win_h // 4)
+
+        # 横向只取中间区域，减少背景
+        center_frac = 0.92
+        x_jitter = 8
+
+        if vertical:
+            # 裁左右
+            cw = int(W * center_frac)
+            x0 = max(0, (W - cw) // 2)
+            qimg_use = qimg[:, x0:x0+cw]
+            qmask_use = qmask_rs[:, x0:x0+cw] if qmask_rs is not None else None
+            Hu, Wu = qimg_use.shape[:2]
+
+            x_base = max(0, (Wu - win_w) // 2)
+            y = 0
+            while y + win_h <= Hu and len(patches) < max_patches:
+                x = x_base + rng.integers(-x_jitter, x_jitter+1) if x_jitter > 0 else x_base
+                x = max(0, min(Wu - win_w, x))
+                y1, y2 = y, y + win_h
+                x1, x2 = x, x + win_w
+
+                if qmask_use is not None:
+                    cover = float(qmask_use[y1:y2, x1:x2].mean()) / 255.0
+                    if cover < min_mask_cover:
+                        y += stride
+                        continue
+
+                patch = qimg_use[y1:y2, x1:x2].copy()
+                patches.append(patch)
+                y += stride
+
+        else:
+            # 横条：裁上下
+            ch = int(H * center_frac)
+            y0 = max(0, (H - ch) // 2)
+            qimg_use = qimg[y0:y0+ch, :]
+            qmask_use = qmask_rs[y0:y0+ch, :] if qmask_rs is not None else None
+            Hu, Wu = qimg_use.shape[:2]
+
+            win_h2 = min(win_w, Hu)
+            win_w2 = min(win_h, Wu)
+            y_base = max(0, (Hu - win_h2) // 2)
+
+            x = 0
+            while x + win_w2 <= Wu and len(patches) < max_patches:
+                y = y_base + rng.integers(-x_jitter, x_jitter+1) if x_jitter > 0 else y_base
+                y = max(0, min(Hu - win_h2, y))
+                y1, y2 = y, y + win_h2
+                x1, x2 = x, x + win_w2
+
+                if qmask_use is not None:
+                    cover = float(qmask_use[y1:y2, x1:x2].mean()) / 255.0
+                    if cover < min_mask_cover:
+                        x += stride
+                        continue
+
+                patch = qimg_use[y1:y2, x1:x2].copy()
+                patches.append(patch)
+                x += stride
+
     else:
-        roi_xyxy = None
+        # ===== 非条形：原方形网格 =====
+        patches_with_xy = _extract_patches_grid(
+            qimg,
+            patch_sizes=patch_sizes,
+            stride_ratio=stride_ratio,
+            max_patches=max_patches,
+            roi_xyxy=None,
+            return_xyxy=True
+        )
 
-    patches_with_xy = _extract_patches_grid(
-        qimg,
-        patch_sizes=patch_sizes,
-        stride_ratio=stride_ratio,
-        max_patches=max_patches,
-        roi_xyxy=roi_xyxy,
-        return_xyxy=True
-    )
+        for patch, (x1, y1, x2, y2) in patches_with_xy:
+            if qmask_rs is not None:
+                cover = float(qmask_rs[y1:y2, x1:x2].mean()) / 255.0
+                if cover < min_mask_cover:
+                    continue
+            patches.append(patch)
 
-    # ✅ 过滤：mask 覆盖率太低的 patch 丢掉
-    filtered = []
-    for patch, xyxy in patches_with_xy:
-        if qmask_rs is not None:
-            x1,y1,x2,y2 = xyxy
-            x1 = max(0, min(qmask_rs.shape[1]-1, int(x1)))
-            y1 = max(0, min(qmask_rs.shape[0]-1, int(y1)))
-            x2 = max(1, min(qmask_rs.shape[1],   int(x2)))
-            y2 = max(1, min(qmask_rs.shape[0],   int(y2)))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            cover = float(qmask_rs[y1:y2, x1:x2].mean()) / 255.0
-            if cover < float(min_mask_cover):
-                continue
-        filtered.append(patch)
+    # ===============================
+    # 4. 兜底（防止 0 patch）
+    # ===============================
+    if len(patches) == 0:
+        patches = [qimg]
 
-    if not filtered:
-        # 兜底：别一个都没有
-        filtered = [p for p, _ in patches_with_xy[:1]]
-
+    # ===============================
+    # 5. backbone 前处理 + 特征提取
+    # ===============================
     tensors = []
-    for p in filtered:
+    for p in patches:
         p224 = cv2.resize(p, (224, 224), interpolation=cv2.INTER_AREA)
         if to_rgb:
             p224 = cv2.cvtColor(p224, cv2.COLOR_BGR2RGB)
@@ -1173,15 +1581,13 @@ def get_query_patch_feats(model, mean, std, to_rgb, qimg_bgr,
         tensors.append(x)
 
     feats_all = []
-    with torch.no_grad():
-        for st in range(0, len(tensors), batch_size):
-            bt = torch.stack(tensors[st:st+batch_size], dim=0).to(DEVICE)
-            fv = extract_feat(model, bt)
-            feats_all.append(fv.cpu())
+    for st in range(0, len(tensors), batch_size):
+        bt = torch.stack(tensors[st:st+batch_size]).to(DEVICE)
+        fv = extract_feat(model, bt)
+        feats_all.append(fv.cpu())
 
     feats = torch.cat(feats_all, dim=0).numpy().astype("float32")
-    return feats, len(filtered)
-
+    return feats, len(patches)
 
 # ============================================================
 # Patch aggregation → image score
@@ -1222,10 +1628,32 @@ def rank_to_rrf_score(rank_list, k=60):
     return s
 
 def is_grid_like(h):
-    if h["grid_score"] < 0.12: return False
-    if h.get("ortho", 0.0) < 0.55: return False
-    if h.get("peak2", 0.0) < 0.035: return False
+    g  = h.get("grid_score", 0.0)
+    ax = h.get("axis_align", 0.0)
+    pk = h.get("ori_peakedness", 0.0)
+    ort= h.get("ortho", 0.0)
+    p2 = h.get("peak2", 0.0)
+    pm = h.get("peak_mass", 0.0)
+
+    # ✅ 只有在“周期能量”也高时才允许 g 很高直接判 grid
+    if g >= 0.22 and pm > 0.010:
+        return True
+
+    if g < 0.10:
+        return False
+
+    if ort < 0.25 or p2 < 0.015:
+        return False
+
+    # pk 低时更谨慎
+    if pk < 2.5:
+        return (ax > 0.22) and (pm > 0.008)
+
     return True
+
+
+
+
 
 def faiss_scores_from_D(index, D: np.ndarray) -> np.ndarray:
     # 返回“越大越好”的 score
@@ -1449,17 +1877,58 @@ def fft_peak_radius(gray, resize=512):
     return float(r_norm)
 
 
+@torch.no_grad()
+def select_query_patches_for_vertical(q_fm_1bchw: torch.Tensor,
+                                      keep=KEEP_PATCHES,
+                                      border=0.02):  # 更小的边距
+    """
+    竖向长条图的patch选择策略
+    """
+    fm = q_fm_1bchw[0]  # (C,H,W)
+    C, H, W = fm.shape
+
+    # 对于长条图，我们希望沿高度方向均匀采样
+    energy = fm.pow(2).sum(dim=0)  # (H,W)
+
+    # 减小边距，充分利用边缘信息
+    y1b = int(H * border)
+    y2b = int(H * (1 - border))
+    x1b = int(W * 0.10)  # 横向用较小边距
+    x2b = int(W * 0.90)
+
+    mask = torch.zeros((H, W), device=energy.device, dtype=torch.bool)
+    mask[y1b:y2b, x1b:x2b] = True
+
+    # 均匀采样高度
+    ys = torch.linspace(y1b, y2b - 1, steps=int(keep * 0.7))
+    xs = torch.randint(x1b, x2b, (len(ys),), device=energy.device)
+
+    idx_all = ys * W + xs
+
+    # 再加上能量最高的点
+    energy_flat = energy.flatten()
+    idx_energy = torch.topk(energy_flat, k=int(keep * 0.3)).indices
+
+    idx = torch.cat([idx_all.long(), idx_energy])
+
+    patches = fm.flatten(1).t()[idx]
+    patches = F.normalize(patches, p=2, dim=1)
+
+    # 坐标归一化
+    ys = (idx // W).float()
+    xs = (idx % W).float()
+    xs = xs / max(1.0, float(W - 1))
+    ys = ys / max(1.0, float(H - 1))
+
+    xy = torch.stack([xs, ys], dim=1)
+    return patches, xy
+
 # 1) 改：cand_gate_score -> 连续 gate（不再依赖 q_is）
 # 最小 diff：保持函数名不变，但增加 q_head 传入；main 里改调用
 # =========================
 def cand_gate_score(cimg_bgr, q_head: dict, return_dbg=False):
     ch = stripe_grid_head_v21(make_head_view(cimg_bgr, prefer_gray=False))
-    # 1) 类别硬门：query 是格子 => candidate 必须格子
-    q_is_grid = (q_head["grid_score"] > 0.18)  # 你这次 q_head.grid=0.735，肯定为 True
-    if q_is_grid and (not is_grid_like(ch)):
-        if return_dbg:
-            return 0.0, "not_grid", 0.0, ch
-        return 0.0
+
     wP = 0.25
     qs = np.array([q_head["stripe_score"], q_head["grid_score"],
                    wP * np.clip(q_head["ori_peakedness"]/6.0, 0.0, 1.0)], np.float32)
@@ -1469,65 +1938,66 @@ def cand_gate_score(cimg_bgr, q_head: dict, return_dbg=False):
     qsn = float(np.linalg.norm(qs))
     csn = float(np.linalg.norm(cs))
 
-    # head 太“平”，cosine 会虚高 → 直接当作不相似
-    if csn < 0.06:
+    if csn < 0.06 or qsn < 1e-6:
         sim = 0.0
     else:
         sim = float((qs * cs).sum() / (qsn * csn + 1e-6))
         sim = max(0.0, min(1.0, sim))
 
-    # -------- init --------
-    g = 0.0
-    reason = "init"
-    plaid_penalty = 1.0   # 必须先初始化，避免 UnboundLocalError
+    def _ret(g, reason):
+        if return_dbg:
+            return float(g), str(reason), float(sim), ch
+        return float(g)
 
-    # 1) plaid 一致性：分强弱
-    if q_head["grid_score"] > 0.18:
+    # 1) 类别硬门：query 强格子 => candidate 必须格子
+    q_is_grid = is_grid_like(q_head)
+    if q_is_grid and (not is_grid_like(ch)):
+        if q_head.get("grid_score", 0.0) >= 0.35:
+            return _ret(0.0, "grid_mismatch_hard")
+        # 弱格子：软惩罚
+        return _ret(0.20, "grid_mismatch_soft")
+
+    # 2) plaid 一致性：分强弱（不要裸 return 0.0）
+    plaid_penalty = 1.0
+    if q_head.get("grid_score", 0.0) > 0.18:
         if not is_grid_like(ch):
-            return 0.0
-        plaid_penalty = 1.0  # strict 通过也明确赋值
-    elif q_head["grid_score"] > 0.10:
-        # 弱 plaid：软惩罚
-        if ch["grid_score"] < 0.02:
-            plaid_penalty = 0.45
-        else:
-            plaid_penalty = 1.0
-    else:
+            return _ret(0.0, "plaid_miss")
         plaid_penalty = 1.0
+    elif q_head.get("grid_score", 0.0) > 0.10:
+        if ch.get("grid_score", 0.0) < 0.02:
+            plaid_penalty = 0.45
 
-    # 2) stripe 一致性（硬门）
-    if q_head["stripe_score"] > 0.15 and ch["stripe_score"] < 0.08:
-        reason = "stripe_miss"
-        if return_dbg:
-            return g, reason, sim, ch
-        return g
+    # 3) stripe 一致性（硬门）
+    if q_head.get("stripe_score", 0.0) > 0.15 and ch.get("stripe_score", 0.0) < 0.08:
+        return _ret(0.0, "stripe_miss")
 
-    # 3) sim 门槛
-    if sim < 0.28:
-        reason = "sim_low"
-        if return_dbg:
-            return g, reason, sim, ch
-        return g
+    # 4) sim 门槛
+    if sim < 0.15:
+        return _ret(0.0, "sim_low")
 
-    # 4) peakedness 惩罚（软门）
+    # 5) peakedness 惩罚（软门）
     peak_penalty = 1.0
-    if q_head["ori_peakedness"] > 5.5 and ch["ori_peakedness"] < 3.8:
+    if q_head.get("ori_peakedness", 0.0) > 5.5 and ch.get("ori_peakedness", 0.0) < 3.8:
         peak_penalty = 0.4
 
-
+    # 6) 尺度一致性（r_peak）——只做 soft penalty，不再 hard kill
     scale_penalty = 1.0
-    if "r_peak" in q_head and "r_peak" in ch:
-        ratio = ch["r_peak"] / (q_head["r_peak"] + 1e-6)
-        if ratio < 0.70 or ratio > 1.45:
-            scale_penalty = 0.6  # 只降权，不直接踢掉
+    if ("r_peak" in q_head) and ("r_peak" in ch):
+        rq = float(q_head.get("r_peak", 0.0))
+        rc = float(ch.get("r_peak", 0.0))
+        # ⚠️ 关键：蕾丝/低 peakedness 不启用尺度 gate
+        if q_head.get("ori_peakedness", 0.0) >= 2.5 and rq > 1e-6 and rc > 1e-6:
+            ratio = rc / (rq + 1e-6)
+
+            if ratio < 0.50 or ratio > 3.00:
+                scale_penalty = 0.35
+            elif ratio < 0.75 or ratio > 1.60:
+                scale_penalty = 0.75
+            else:
+                scale_penalty = 1.0
 
     g = float((0.60 + 0.55 * sim) * peak_penalty * plaid_penalty * scale_penalty)
-
-    reason = "pass"
-
-    if return_dbg:
-        return g, reason, sim, ch
-    return g
+    return _ret(g, "pass")
 
 # ============================================================
 # Main
@@ -1542,7 +2012,23 @@ def main():
     set_faiss_nprobe(p_index, 64)
 
     img_paths = np.load(GLOBAL_META, allow_pickle=True)
+
+    target = "TL05027"
+    hit = [i for i, p in enumerate(img_paths) if target in os.path.basename(str(p))]
+    print("[CHECK] TL05027 in index?", len(hit), hit[:10])
+    if len(hit) > 0:
+        print("example path:", img_paths[hit[0]])
     patch_meta = np.load(PATCH_META, allow_pickle=True)
+
+    tid = hit[0]  # 351
+    pm = patch_meta
+    if isinstance(pm, np.ndarray) and pm.ndim == 2:
+        img_ids = pm[:, 0].astype(np.int64)
+    else:
+        img_ids = np.array([int(x[0]) for x in pm], dtype=np.int64)
+
+    cnt = int((img_ids == tid).sum())
+    print(f"[CHECK] patches for TL05027(img_id={tid}) in patch_meta:", cnt)
 
     model, mean, std, to_rgb = build_model(CONFIG, CKPT)
 
@@ -1553,7 +2039,7 @@ def main():
         score_thr=SEG_SCORE_THR,
         use_classes=SEG_USE_CLASSES,
         merge_all=True,
-        do_rectify=True,
+        do_rectify=False,
         warp_border="reflect",
         bg_mode="mean",
         debug_dir=OUT_DIR
@@ -1564,9 +2050,17 @@ def main():
 
     q_head_img = make_head_view(qimg_raw, prefer_gray=True)
     q_head = stripe_grid_head_v21(q_head_img)
-    q_is_stripe_like  = (q_head["stripe_score"] > 0.12)
-    q_is_grid_like  = (q_head["grid_score"] > 0.08)
-
+    q_is_stripe_like = (
+            q_head["stripe_score"] > 0.18 and
+            q_head["ori_peakedness"] > 2.8 and
+            q_head["peak_mass"] > 0.010
+    )
+    q_is_grid_like = (
+            q_head["grid_score"] > 0.18 and
+            q_head["ori_peakedness"] > 2.8 and
+            q_head["peak_mass"] > 0.010 and
+            q_head["axis_align"] > 0.22
+    )
 
     print(
         f"[HEADv2.1] stripe={q_head['stripe_score']:.3f} "
@@ -1580,16 +2074,34 @@ def main():
     # -------- Global search
     _, gids = g_index.search(qvec, TOPG)
     # -------- Patch search (FIXED)
-    q_patch_vecs, n_qpatch = get_query_patch_feats(
-        model, mean, std, to_rgb, qimg,
-        patch_sizes=(256, 384, 512),
-        stride_ratio=0.5,
-        max_patches=64,
-        long_edge=1024,
-        batch_size=64,
-        qmask=qmask,  # ✅ 新增
-        min_mask_cover=0.22  # ✅ 可调：0.25~0.45
-    )
+    # 判断是否为竖向长条
+    H, W = qimg.shape[:2]
+    is_vertical_stripe = (H / W >= 4.0)  # 高宽比大于4:1
+
+    if is_vertical_stripe:
+        print(f"[VERTICAL STRIPE DETECTED] {W}x{H} (aspect ratio: {H / W:.2f})")
+        q_patch_vecs, n_qpatch = get_query_patch_feats_for_vertical_stripe(
+            model, mean, std, to_rgb, qimg,
+            long_edge=1024,
+            patch_width=224,
+            patch_height=224,
+            stride_ratio=0.25,  # 更密集
+            max_patches=256,
+            qmask=qmask,
+            min_mask_cover=0.01  # 极低门槛
+        )
+    else:
+        # 使用原来的逻辑
+        q_patch_vecs, n_qpatch = get_query_patch_feats(
+            model, mean, std, to_rgb, qimg,
+            patch_sizes=(256, 384, 512),
+            stride_ratio=0.35,
+            max_patches=128,
+            long_edge=1024,
+            batch_size=64,
+            qmask=qmask,
+            min_mask_cover=0.05
+        )
 
     print(f"[PATCH] query patches = {n_qpatch}, vecs shape = {q_patch_vecs.shape}")
 
@@ -1612,8 +2124,17 @@ def main():
     patch_rank = aggregate_patch_hits(
         patch_ids_all, patch_scores_all, patch_meta, top_images=TOP_PATCH_IMAGES,tau=0.15
     )
+    tid = hit[0]  # pick first
     global_rank = clean_rank(gids[0].tolist())
+    gr = global_rank
+    pos_g = gr.index(tid) if tid in gr else -1
+    print("[RANK] TL05027 global pos:", pos_g)
     patch_rank = clean_rank(patch_rank)
+    # patch rank position
+    pr = patch_rank
+    pos_p = pr.index(tid) if tid in pr else -1
+    print("[RANK] TL05027 patch pos:", pos_p)
+
     print("[PATCH] top patch-rank ids:", patch_rank[:10])
     print("[GLOBAL] top global-rank ids:", global_rank[:10])
 
@@ -1635,11 +2156,16 @@ def main():
         final_rrf[k] = final_rrf.get(k, 0.0) + w_g * v
     for k, v in rrf_p.items():
         final_rrf[k] = final_rrf.get(k, 0.0) + w_p * v
-
+    # 修改旋转角度
+    if is_vertical_stripe:
+        # 竖向长条：小幅旋转就够了
+        angles = [-10, -5, 0, 5, 10]
+    else:
+        angles = [-30, -15, 0, 15, 30]
     q_desc_list = []
     q_xy_list = []
 
-    for ang in [-30, -15, 0, 15, 30]:
+    for ang in angles:
         qimg_r = rotate_bgr(qimg, ang)
         qx = make_single_tensor_for_rerank(qimg_r, mean, std, to_rgb=to_rgb).to(DEVICE)
         q_fm = extract_featmap(model, qx, FEAT_LEVEL)
@@ -1655,7 +2181,7 @@ def main():
     scored = []
     fused2 = []
 
-    fail_cnt = {"plaid_miss": 0, "stripe_miss": 0, "sim_low": 0}
+    fail_cnt = {"plaid_miss": 0, "stripe_miss": 0, "sim_low": 0, "scale_mismatch_hard":0}
     shown = 0
 
     for img_id in fused:
@@ -1663,19 +2189,17 @@ def main():
         if cimg0 is None or cimg0.size == 0:
             continue
         g0, reason, sim, ch = cand_gate_score(cimg0, q_head, return_dbg=True)
-        print("rp_q", q_head.get("r_peak"), "rp_c", ch.get("r_peak"))
+        # print("rp_q", q_head.get("r_peak"), "rp_c", ch.get("r_peak"))
         if g0 <= 0:
             fail_cnt[reason] = fail_cnt.get(reason, 0) + 1
             if shown < 20:
-                print(f"[FAIL] id={img_id} reason={reason} sim={sim:.3f} "
-                      f"ch_s={ch['stripe_score']:.3f} ch_g={ch['grid_score']:.3f} ch_p={ch['ori_peakedness']:.2f} "
-                      f"name={os.path.basename(str(img_paths[img_id]))}")
                 shown += 1
             continue
         fused2.append(img_id)
     print("[HEADGATE FAIL STAT]", fail_cnt)
     print("[FUSED] before:", len(fused), "after head gate:", len(fused2))
     print(f"... axis_align={ch.get('axis_align', 0):.3f} ...")
+
 
     fused = fused2
     for img_id in fused:
@@ -1700,11 +2224,14 @@ def main():
                 periodic_cover_topM_thr=PERIODIC_COVER_TOPM_THR,
                 periodic_cover_xy_thr=PERIODIC_COVER_XY_THR,
                 tex_topk_core=128, tex_min_pairs=12,
-                tex_weight=0.85 , # ✅ 提高 texture 权重,
+                tex_weight=0.85 , # 提高 texture 权重,
                 return_ng0=True
             )
-            if q_head["grid_score"] > 0.10 and ng0 < 5:
-                s = 0.0
+            # 强 plaid：如果候选不是 grid_like，texture 分支再强也压掉
+            if q_head["grid_score"] > 0.35:
+                ch_tmp = stripe_grid_head_v21(make_head_view(cimg_cache[img_id], prefer_gray=False))
+                if not is_grid_like(ch_tmp):
+                    s = 0.0
             if s > 0:
                 geom_best += s
                 cnt += 1
@@ -1735,16 +2262,22 @@ def main():
         cimg = cimg_cache.get(img_id, None)
         if cimg is None:
             cimg = imread_unicode(img_paths[img_id])
+
             if cimg is None or cimg.size == 0:
                 continue
+            H, W = cimg.shape[:2]
+            q_ar = max(W / H, H / W)
+            if q_ar > 4.0:
+                if q_ar < 3.0:
+                    continue
             cimg_cache[img_id] = cimg
 
         g, reason, sim, ch = cand_gate_score(cimg, q_head, return_dbg=True)
         # fail_cnt[reason] = fail_cnt.get(reason, 0) + 1
         if g > 0:
-            print(f"[PASS] id={img_id} g={g:.3f} sim={sim:.3f} reason={reason} "
-                  f"ch_s={ch['stripe_score']:.3f} ch_g={ch['grid_score']:.3f} ch_p={ch['ori_peakedness']:.2f} "
-                  f"name={os.path.basename(str(img_paths[img_id]))}")
+            # print(f"[PASS] id={img_id} g={g:.3f} sim={sim:.3f} reason={reason} "
+            #       f"ch_s={ch['stripe_score']:.3f} ch_g={ch['grid_score']:.3f} ch_p={ch['ori_peakedness']:.2f} "
+            #       f"name={os.path.basename(str(img_paths[img_id]))}")
             final2.append((img_id, fs * (0.75 + 0.25 * g), gs))
         else:
             # 只看前20个失败原因也行，避免刷屏
@@ -1809,5 +2342,198 @@ def main():
         print(f"{r:02d}  score={fs:.3f}  {img_paths[img_id]}")
     print("Saved:", out)
 
+
+def main_with_debug():
+    """带完整调试的主函数"""
+    # 初始化调试器
+    debugger = SearchDebugger(os.path.join(OUT_DIR, "debug"))
+
+    print("[PID]", os.getpid())
+    ensure_dir(OUT_DIR)
+
+    # 1. 加载索引和模型
+    debugger.log("Loading FAISS indexes and model...")
+    g_index = faiss.read_index(GLOBAL_INDEX)
+    p_index = faiss.read_index(PATCH_INDEX)
+    set_faiss_nprobe(g_index, 64)
+    set_faiss_nprobe(p_index, 64)
+
+    img_paths = np.load(GLOBAL_META, allow_pickle=True)
+    patch_meta = np.load(PATCH_META, allow_pickle=True)
+
+    model, mean, std, to_rgb = build_model(CONFIG, CKPT)
+
+    # 2. 查询图像处理
+    debugger.log(f"Loading query image: {QUERY_IMG}")
+    qimg = imread_unicode(QUERY_IMG)
+    debugger.log(f"Original query size: {qimg.shape}")
+
+    # 检查是否为长条图
+    H, W = qimg.shape[:2]
+    aspect_ratio = H / W
+    is_vertical_stripe = aspect_ratio >= 4.0
+    debugger.log(f"Aspect ratio: {aspect_ratio:.2f}, Is vertical stripe: {is_vertical_stripe}")
+
+    # 可视化原始图像
+    debugger.visualize_query_processing(qimg, stage="original")
+
+    # 3. 分割和裁剪
+    debugger.log("Applying segmentation and cropping...")
+    qimg, qmask, qimg_raw = crop_by_mmdet_mask_final(
+        qimg,
+        score_thr=SEG_SCORE_THR,
+        use_classes=SEG_USE_CLASSES,
+        merge_all=True,
+        do_rectify=False,
+        warp_border="reflect",
+        bg_mode="mean",
+        debug_dir=debugger.out_dir
+    )
+
+    debugger.log(f"After cropping: {qimg.shape}")
+    debugger.visualize_query_processing(qimg, mask=qmask, crop_img=qimg_raw, stage="cropped")
+
+    # 保存裁剪后的图像用于调试
+    cv2.imwrite(str(debugger.out_dir / "query_cropped_debug.jpg"), qimg)
+
+    # 4. 分析query的纹理特征
+    debugger.log("Analyzing query texture features...")
+    q_head_img = make_head_view(qimg_raw, prefer_gray=True)
+    q_head = stripe_grid_head_v21(q_head_img)
+
+    debugger.log(f"Query HEAD analysis:")
+    debugger.log(f"  Stripe score: {q_head['stripe_score']:.3f}")
+    debugger.log(f"  Grid score: {q_head['grid_score']:.3f}")
+    debugger.log(f"  Peakedness: {q_head['ori_peakedness']:.2f}")
+    debugger.log(f"  Axis align: {q_head.get('axis_align', 0):.3f}")
+    debugger.log(f"  R_peak: {q_head.get('r_peak', 0):.3f}")
+    debugger.log(f"  Peak mass: {q_head.get('peak_mass', 0):.4f}")
+
+    # 5. 检查目标图片是否在索引中
+    debugger.log("Checking if target exists in index...")
+    target_name = "TL05027"
+    target_indices = [i for i, p in enumerate(img_paths) if target_name in os.path.basename(str(p))]
+
+    if not target_indices:
+        debugger.log(f"ERROR: Target {target_name} not found in index!", level="ERROR")
+        return
+    else:
+        target_idx = target_indices[0]
+        debugger.log(f"Target found at index {target_idx}: {img_paths[target_idx]}")
+
+    # 6. 提取特征并搜索
+    debugger.log("Extracting query features and searching...")
+
+    # 全局特征
+    qvec = get_query_global_feat(model, mean, std, to_rgb, qimg)
+    debugger.log(f"Global feature extracted, shape: {qvec.shape}, norm: {np.linalg.norm(qvec):.3f}")
+
+    # Patch特征（针对长条图优化）
+    debugger.log("Extracting patch features...")
+
+    if is_vertical_stripe:
+        debugger.log("Using vertical stripe patch extraction strategy")
+        q_patch_vecs, n_qpatch = get_query_patch_feats_for_vertical_stripe(
+            model, mean, std, to_rgb, qimg,
+            long_edge=1024,
+            patch_width=224,
+            patch_height=224,
+            stride_ratio=0.25,
+            max_patches=256,
+            qmask=qmask,
+            min_mask_cover=0.01
+        )
+    else:
+        q_patch_vecs, n_qpatch = get_query_patch_feats(
+            model, mean, std, to_rgb, qimg,
+            patch_sizes=(256, 384, 512),
+            stride_ratio=0.35,
+            max_patches=128,
+            long_edge=1024,
+            batch_size=64,
+            qmask=qmask,
+            min_mask_cover=0.05
+        )
+
+    debugger.log(f"Extracted {n_qpatch} patches, feature shape: {q_patch_vecs.shape}")
+
+    # 7. 执行搜索
+    debugger.log("Performing global search...")
+    _, gids = g_index.search(qvec, TOPG)
+    global_rank = clean_rank(gids[0].tolist())
+
+    # 检查目标在全局搜索中的排名
+    target_global_rank = global_rank.index(target_idx) if target_idx in global_rank else -1
+    debugger.log(f"Target global search rank: {target_global_rank}")
+
+    debugger.log("Performing patch search...")
+    D, I = p_index.search(q_patch_vecs, PATCH_TOPK_PER_QPATCH)
+    S = faiss_scores_from_D(p_index, D)
+
+    patch_ids_all = I.reshape(-1).tolist()
+    patch_scores_all = S.reshape(-1).tolist()
+
+    patch_rank = aggregate_patch_hits(
+        patch_ids_all, patch_scores_all, patch_meta, top_images=TOP_PATCH_IMAGES, tau=0.15
+    )
+    patch_rank = clean_rank(patch_rank)
+
+    # 检查目标在patch搜索中的排名
+    target_patch_rank = patch_rank.index(target_idx) if target_idx in patch_rank else -1
+    debugger.log(f"Target patch search rank: {target_patch_rank}")
+
+    # 8. 分析搜索结果
+    debugger.log("Analyzing search results...")
+
+    # 收集前20个结果的详细信息
+    top_results_info = []
+    for rank, img_id in enumerate(global_rank[:20], 1):
+        img_name = os.path.basename(str(img_paths[img_id]))
+        is_target = (img_id == target_idx)
+        top_results_info.append({
+            "rank": rank,
+            "img_id": img_id,
+            "name": img_name,
+            "is_target": is_target
+        })
+        debugger.log(f"Global Rank {rank}: {img_name} {'[TARGET]' if is_target else ''}")
+
+    # 9. 记录搜索指标
+    search_metrics = {
+        "query_info": {
+            "original_size": list(qimg.shape),
+            "cropped_size": list(qimg.shape) if 'qimg' in locals() else None,
+            "aspect_ratio": float(aspect_ratio),
+            "is_vertical_stripe": is_vertical_stripe,
+            "texture_features": q_head
+        },
+        "search_results": {
+            "global_top5": [os.path.basename(str(img_paths[i])) for i in global_rank[:5]],
+            "patch_top5": [os.path.basename(str(img_paths[i])) for i in patch_rank[:5]],
+            "target_global_rank": target_global_rank,
+            "target_patch_rank": target_patch_rank,
+            "target_found_global": target_global_rank > 0,
+            "target_found_patch": target_patch_rank > 0
+        },
+        "performance": {
+            "num_patches_extracted": n_qpatch,
+            "patch_feature_dim": q_patch_vecs.shape[1] if 'q_patch_vecs' in locals() else None
+        }
+    }
+
+    debugger.record_search_metrics(search_metrics)
+
+    # 10. 可视化patch提取位置
+    # 注意：这需要修改get_query_patch_feats函数来返回patch位置信息
+    # 这里假设函数已经修改为返回 (feats, n_patches, patch_locations)
+
+    # 11. 保存所有调试信息
+    debugger.save_debug_info()
+
+    debugger.log("Debugging completed. Check the debug directory for detailed information.")
+
+    # 继续正常的重排序和结果展示流程...
+    # ... [保持原有的重排序代码，但添加更多调试输出]
 if __name__ == "__main__":
-    main()
+    # main()
+    main_with_debug()

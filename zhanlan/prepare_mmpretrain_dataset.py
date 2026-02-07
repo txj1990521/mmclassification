@@ -13,7 +13,7 @@ from collections import defaultdict
 # =========================
 
 DATA_ROOT = r"D:\zhanlan\new_data"           # 原始数据根目录
-OUT_DIR = r"D:\zhanlan\newData\ann"              # 输出标注目录（train.txt/test.txt/classes.txt）
+OUT_DIR = r"D:\zhanlan\newData\ann1"              # 输出标注目录（train.txt/test.txt/classes.txt）
 SPLIT_OUT_ROOT = r"D:\zhanlan\newData\split_data"  # 拆分后复制到这里（train/ test 子目录）
 
 MODE = "unsupervised"  # "unsupervised" 或 "supervised"

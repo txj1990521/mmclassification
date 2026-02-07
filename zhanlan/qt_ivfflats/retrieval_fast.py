@@ -36,6 +36,7 @@ GLOBAL_INDEX = os.path.join(INDEX_DIR, "global.index")
 PATCH_INDEX  = os.path.join(INDEX_DIR, "patch.index")
 GLOBAL_META  = os.path.join(INDEX_DIR, "global_img_paths.npy")
 PATCH_META   = os.path.join(INDEX_DIR, "patch_meta.npy")
+force_reload_flag=True #是否重新加载库的数据
 
 # ============================================================
 # Runtime / device
@@ -261,12 +262,13 @@ def set_faiss_nprobe(index, nprobe=64):
     except Exception:
         pass
 
-def get_ctx():
+def get_ctx(force_reload=False):
     """Load faiss indices + meta + model once (Qt repeated queries)."""
     global _CTX
-    if _CTX is not None:
+    if not force_reload and _CTX is not None:
         return _CTX
 
+    # 强制重新加载索引和元数据
     g_index = faiss.read_index(GLOBAL_INDEX)
     p_index = faiss.read_index(PATCH_INDEX)
     set_faiss_nprobe(g_index, 64)
@@ -279,6 +281,7 @@ def get_ctx():
 
     _CTX = (g_index, p_index, img_paths, patch_meta, model, mean, std, to_rgb)
     return _CTX
+
 
 # ============================================================
 # Model helpers
@@ -880,7 +883,7 @@ def run_retrieval(query_path: str, out_dir: str, topk: int = TOPK_DEFAULT):
       top_items: [{"path": str, "score": float, "geom": float, "id": int}, ...]
     """
     ensure_dir(out_dir)
-    g_index, p_index, img_paths, patch_meta, model, mean, std, to_rgb = get_ctx()
+    g_index, p_index, img_paths, patch_meta, model, mean, std, to_rgb = get_ctx(force_reload=force_reload_flag)
 
     qimg = imread_unicode(query_path)
     qimg = crop_by_feat_energy_qt_safe(

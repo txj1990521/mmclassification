@@ -2,20 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Optimized for RTX 4060 8GB:
-- Candidate rerank feature-map extraction -> BATCH forward (better GPU utilization)
-- AMP(fp16) for backbone forward (speed)
+Qt-friendly + Optimized retrieval (RTX 4060 8GB):
+- Keep algorithm logic as-is (RRF + geom_score_compatible)
+- Candidate rerank featmap extraction -> BATCH forward
+- AMP(fp16) for backbone forward
 - Two-stage rotation (0° first; only hard cases run extra rotations)
-- Slightly reduced PATCH_TOPK_PER_QPATCH (default 200) for speed (can tune back)
-- Cleaned duplicate imports / duplicate constants
-
-Keep your algorithm logic as-is (RRF + geom_score_compatible).
+- PATCH_TOPK_PER_QPATCH reduced (default 200) for speed (tune 200~400)
+- Context cache: model/faiss/meta loaded once for Qt repeated queries
 """
 
 import os
 import cv2
 import faiss
-import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -33,15 +31,12 @@ from torch.cuda.amp import autocast
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_build_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\微信图片_20260128110352_32_7.jpg"
-
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid_new_data"
 GLOBAL_INDEX = os.path.join(INDEX_DIR, "global.index")
 PATCH_INDEX  = os.path.join(INDEX_DIR, "patch.index")
 GLOBAL_META  = os.path.join(INDEX_DIR, "global_img_paths.npy")
 PATCH_META   = os.path.join(INDEX_DIR, "patch_meta.npy")
-
-OUT_DIR = r"D:\zhanlan\search_vis"
+force_reload_flag=False #是否重新加载库的数据
 
 # ============================================================
 # Runtime / device
@@ -54,16 +49,14 @@ USE_AMP = (DEVICE == "cuda")   # enable fp16 amp
 torch.backends.cudnn.benchmark = True
 
 # ============================================================
-# Retrieval params
+# Retrieval params (aligned to optimized search code)
 # ============================================================
-TOPK = 12
-
-
 TOPG = 300
-PATCH_TOPK_PER_QPATCH = 200    # was 400 (speed up). tune 200~400
+TOPK_DEFAULT = 12
+
+PATCH_TOPK_PER_QPATCH = 200    # optimized search default
 TOP_PATCH_IMAGES = 600
 RRF_K = 60
-
 GEOM_TOPN = 200                # rerank only on topN after fusion
 
 # ============================================================
@@ -78,7 +71,7 @@ BORDER = 0.05
 Q_ROI_FRAC = 0.18
 C_ROI_FRAC = 0.18
 Q_ROI_RATIO = 0.50
-C_ROI_RATIO = 1.00  # reserved (candidate uses ROI if exists else fallback)
+C_ROI_RATIO = 1.00  # reserved
 
 # geom params
 MARGIN = 0.015
@@ -96,6 +89,14 @@ ROT_FAST = [0]
 ROT_FULL = [-30, -15, 0, 15, 30]
 ROT_TRIGGER = 0.10   # if score(0deg) < this, try full rotations
 
+# geom fusion
+BETA_GEOM = 0.3
+
+# ============================================================
+# Global caches for Qt repeated calls
+# ============================================================
+_CTX = None
+_q_full_cache = {}  # key -> (q_desc_list_full, q_xy_list_full)
 
 # ============================================================
 # Utils
@@ -131,99 +132,120 @@ def pad_to_square(img_rgb: np.ndarray):
     return cv2.copyMakeBorder(img_rgb, top, bottom, left, right, cv2.BORDER_REFLECT101)
 
 @torch.no_grad()
-def crop_by_feat_energy(
+def crop_by_feat_energy_qt_safe(
     model,
     img_bgr: np.ndarray,
     mean, std,
     to_rgb: bool,
     prefer_level: int = -2,
-    input_size: int = 512,         # 和 RMAC_INPUT_SIZE 一致
-    top_frac: float = 0.20,        # 取能量 top 20% 做mask，0.15~0.30可调
-    border_frac: float = 0.06,     # 去掉边缘一圈，防止背景贴边干扰
-    min_area_frac: float = 0.15,   # 最大连通域面积太小则回退
-    pad_px: int = 16,              # bbox 外扩像素
-    morph_ks: int = 11,            # mask 形态学核大小
+    input_size: int = 512,
+    top_frac: float = 0.20,
+    border_frac: float = 0.08,
+    min_area_frac: float = 0.18,
+    pad_px: int = 24,
+    morph_ks: int = 13,
 ):
     """
-    返回：裁剪后的 BGR 图（基于 pad_to_square 后的坐标裁剪）
-    - 如果裁剪不可靠，会回退返回原图
+    Qt / 工程稳定版裁剪：
+    - fp32
+    - no AMP
+    - no cudnn benchmark
+    - single pad_to_square
+    - strong fallback
     """
     if img_bgr is None or img_bgr.size == 0:
         return img_bgr
 
-    # 1) pad to square（在原分辨率上做）
+    # ---------- 0. 强制确定性 ----------
+    torch.backends.cudnn.benchmark = False
+
+    # ---------- 1. pad 一次（唯一一次） ----------
     img_sq = pad_to_square(img_bgr)
-    Hs, Ws = img_sq.shape[:2]
-    S = max(Hs, Ws)  # square size
+    S = img_sq.shape[0]
 
-    # 2) 做一份 512 输入，跑 backbone featmap
+    # ---------- 2. 构造 512 输入（不走 make_single_tensor_for_rerank） ----------
     img_in = cv2.resize(img_sq, (input_size, input_size), interpolation=cv2.INTER_LINEAR)
-    x = make_single_tensor_for_rerank(img_in, mean, std, to_rgb=to_rgb).to(DEVICE)  # (1,3,512,512)
-    fm = extract_featmap(model, x, prefer_level)  # (1,C,Hf,Wf)
-    if fm is None:
-        return img_bgr
 
-    # 3) energy map -> upsample to 512
-    e = fm[0].pow(2).sum(dim=0, keepdim=True).unsqueeze(0)  # (1,1,Hf,Wf)
-    e = F.interpolate(e, size=(input_size, input_size), mode="bilinear", align_corners=False)[0, 0]
-    e = e - e.min()
-    e = e / (e.max() + 1e-6)
-    e_np = e.detach().float().cpu().numpy()
+    if to_rgb:
+        img_rgb = cv2.cvtColor(img_in, cv2.COLOR_BGR2RGB)
+    else:
+        img_rgb = img_in[:, :, ::-1].copy()
 
-    # 4) 边缘抑制（防止背景贴边）
-    b = int(round(input_size * border_frac))
+    x = img_rgb.astype(np.float32)
+    x = (x - mean) / std
+    x = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(DEVICE)
+
+    # ---------- 3. backbone（无 AMP） ----------
+    out = model.backbone(x)
+
+    if isinstance(out, (tuple, list)):
+        fm = out[prefer_level]
+    elif isinstance(out, dict):
+        fm = list(out.values())[-1]
+    else:
+        fm = out
+
+    fm = fm.float()[0]   # (C,Hf,Wf)
+
+    # ---------- 4. energy map ----------
+    e = fm.pow(2).sum(dim=0, keepdim=True).unsqueeze(0)
+    e = F.interpolate(e, size=(input_size, input_size),
+                      mode="bilinear", align_corners=False)[0, 0]
+
+    e -= e.min()
+    e /= (e.max() + 1e-6)
+    e_np = e.cpu().numpy()
+
+    # ---------- 5. 边缘抑制 ----------
+    b = int(input_size * border_frac)
     if b > 0:
-        e_np[:b, :] *= 0.2
-        e_np[-b:, :] *= 0.2
-        e_np[:, :b] *= 0.2
-        e_np[:, -b:] *= 0.2
+        e_np[:b, :] *= 0.1
+        e_np[-b:, :] *= 0.1
+        e_np[:, :b] *= 0.1
+        e_np[:, -b:] *= 0.1
 
-    # 5) top_frac 阈值二值化（只在非零区域上取分位数更稳）
-    flat = e_np.reshape(-1)
-    thr = np.quantile(flat, 1.0 - float(top_frac))
+    # ---------- 6. top-p mask ----------
+    thr = np.quantile(e_np.reshape(-1), 1.0 - top_frac)
     mask = (e_np >= thr).astype(np.uint8) * 255
 
-    # 6) 形态学，让区域更连贯
-    k = max(3, int(morph_ks) | 1)
+    # ---------- 7. morphology ----------
+    k = max(3, morph_ks | 1)
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  ker, iterations=1)
 
-    # 7) 最大连通域 bbox
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    # ---------- 8. 最大连通域 ----------
+    num, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num <= 1:
         return img_bgr
 
     areas = stats[1:, cv2.CC_STAT_AREA]
     i = 1 + int(np.argmax(areas))
-    x0, y0, ww, hh, area = stats[i]
+    x0, y0, w0, h0, area = stats[i]
 
-    # 8) 回退保护：最大区域太小 -> 不裁
     if area < min_area_frac * (input_size * input_size):
         return img_bgr
 
-    # 9) bbox 外扩 + 映射回 square 原图坐标
+    # ---------- 9. 映射回原图 ----------
     x1 = max(0, x0 - pad_px)
     y1 = max(0, y0 - pad_px)
-    x2 = min(input_size, x0 + ww + pad_px)
-    y2 = min(input_size, y0 + hh + pad_px)
+    x2 = min(input_size, x0 + w0 + pad_px)
+    y2 = min(input_size, y0 + h0 + pad_px)
 
-    # 512坐标 -> img_sq坐标
     scale = float(S) / float(input_size)
     X1 = int(round(x1 * scale))
     Y1 = int(round(y1 * scale))
     X2 = int(round(x2 * scale))
     Y2 = int(round(y2 * scale))
 
-    X1 = max(0, min(S - 2, X1))
-    Y1 = max(0, min(S - 2, Y1))
-    X2 = max(X1 + 2, min(S, X2))
-    Y2 = max(Y1 + 2, min(S, Y2))
+    X1 = max(0, min(S - 4, X1))
+    Y1 = max(0, min(S - 4, Y1))
+    X2 = max(X1 + 4, min(S, X2))
+    Y2 = max(Y1 + 4, min(S, Y2))
 
     crop = img_sq[Y1:Y2, X1:X2].copy()
 
-    # 再加一道保护：裁剪结果过小就回退
-    if crop.shape[0] * crop.shape[1] < 0.12 * (S * S):
+    if crop.shape[0] * crop.shape[1] < 0.15 * (S * S):
         return img_bgr
 
     return crop
@@ -239,6 +261,26 @@ def set_faiss_nprobe(index, nprobe=64):
             print(f"[FAISS] set nprobe={base.nprobe}/{base.nlist}")
     except Exception:
         pass
+
+def get_ctx(force_reload=False):
+    """Load faiss indices + meta + model once (Qt repeated queries)."""
+    global _CTX
+    if not force_reload and _CTX is not None:
+        return _CTX
+
+    # 强制重新加载索引和元数据
+    g_index = faiss.read_index(GLOBAL_INDEX)
+    p_index = faiss.read_index(PATCH_INDEX)
+    set_faiss_nprobe(g_index, 64)
+    set_faiss_nprobe(p_index, 64)
+
+    img_paths = np.load(GLOBAL_META, allow_pickle=True)
+    patch_meta = np.load(PATCH_META, allow_pickle=True)
+
+    model, mean, std, to_rgb = build_model(CONFIG, CKPT)
+
+    _CTX = (g_index, p_index, img_paths, patch_meta, model, mean, std, to_rgb)
+    return _CTX
 
 
 # ============================================================
@@ -259,7 +301,6 @@ def build_model(cfg_path, ckpt_path):
 
 @torch.no_grad()
 def extract_feat(model, imgs):
-    # global feat
     with autocast(enabled=USE_AMP):
         feat = model.backbone(imgs)
     if isinstance(feat, (tuple, list)):
@@ -271,7 +312,6 @@ def extract_feat(model, imgs):
 
 @torch.no_grad()
 def extract_featmap(model, batch_tensor: torch.Tensor, prefer_level: int):
-    # feature map for rerank (kept compatible with dict/list outputs)
     with autocast(enabled=USE_AMP):
         out = model.backbone(batch_tensor)
 
@@ -327,15 +367,10 @@ def make_batch_tensor_for_rerank(imgs_bgr: List[np.ndarray], mean, std, to_rgb: 
         xs.append(torch.from_numpy(x))
     return torch.stack(xs, dim=0)  # (B,3,H,W)
 
-
 # ============================================================
 # Patch selection (energy ROI + top patches)
 # ============================================================
 def energy_roi_box(fm_1chw: torch.Tensor, frac=0.18):
-    """
-    fm_1chw: (C,H,W)
-    return bbox (x1,y1,x2,y2) in featmap coords
-    """
     e = fm_1chw.pow(2).sum(dim=0)  # (H,W)
     flat = e.flatten()
     k = max(1, int(flat.numel() * frac))
@@ -350,12 +385,6 @@ def energy_roi_box(fm_1chw: torch.Tensor, frac=0.18):
 
 @torch.no_grad()
 def select_top_patches_with_xy(feat_map_1bchw: torch.Tensor, keep=256, border=0.05, roi_fbox=None):
-    """
-    feat_map_1bchw: (1,C,H,W)
-    return:
-      patches: (K,C) L2
-      xy:      (K,2) float normalized [0,1]
-    """
     fm = feat_map_1bchw[0]  # (C,H,W)
     C, H, W = fm.shape
     energy = fm.pow(2).sum(dim=0)  # (H,W)
@@ -390,7 +419,6 @@ def select_top_patches_with_xy(feat_map_1bchw: torch.Tensor, keep=256, border=0.
 
     ys = (idx // W).float()
     xs = (idx % W).float()
-
     xs = xs / max(1.0, float(W - 1))
     ys = ys / max(1.0, float(H - 1))
     xy = torch.stack([xs, ys], dim=1)
@@ -426,7 +454,6 @@ def select_candidate_patches(c_fm_1bchw: torch.Tensor,
     d, x = select_top_patches_with_xy(c_fm_1bchw, keep=keep, border=border, roi_fbox=c_roi)
     return d, x
 
-
 # ============================================================
 # Global query feat
 # ============================================================
@@ -438,7 +465,6 @@ def get_query_global_feat(model, mean, std, to_rgb, img_bgr):
     x = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(DEVICE, non_blocking=True)
     with torch.no_grad():
         return extract_feat(model, x).cpu().numpy().astype("float32")
-
 
 # ============================================================
 # Query patch features (for patch index search)
@@ -534,7 +560,6 @@ def get_query_patch_feats(model, mean, std, to_rgb, qimg_bgr,
     feats = torch.cat(feats_all, dim=0).numpy().astype("float32")
     return feats, len(patches)
 
-
 # ============================================================
 # Patch aggregation → image score
 # ============================================================
@@ -590,7 +615,6 @@ def clean_rank(rank_list):
         seen.add(x)
         out.append(x)
     return out
-
 
 # ============================================================
 # geom scoring core (your original logic)
@@ -678,7 +702,6 @@ def geom_score_adaptive(
     shape_scale = float(np.exp(-ratio_std / 0.55)) * float(shape_gate)
 
     d = cg - qg
-
     dx_bin = torch.round(d[:, 0] / bin_size)
     dy_bin = torch.round(d[:, 1] / bin_size)
     keys = dx_bin * 10000 + dy_bin
@@ -770,7 +793,6 @@ def geom_score_compatible(q_desc, q_xy, c_desc, c_xy,
     )
     return float(s_tex * tex_weight)
 
-
 # ============================================================
 # Visualization (Grid)
 # ============================================================
@@ -823,7 +845,6 @@ def visualize_grid(query_bgr, top_imgs_bgr, top_scores, out_path,
     cv2.imwrite(out_path, canvas)
     return out_path
 
-
 # ============================================================
 # Some scoring confidence (kept from your script)
 # ============================================================
@@ -834,57 +855,61 @@ def global_confidence(global_rank, img_paths, topn=20):
     c = Counter(prefix).most_common(1)[0][1]
     return c / max(1, len(prefix))
 
+def get_full_rot_query_desc(model, mean, std, to_rgb, qimg, qimg_key: str):
+    """Cache FULL rotations query desc/xy (only computed for hard case)."""
+    global _q_full_cache
+    if qimg_key in _q_full_cache:
+        return _q_full_cache[qimg_key]
+
+    q_desc_list_full, q_xy_list_full = [], []
+    for ang in ROT_FULL:
+        qimg_r = rotate_bgr(qimg, ang)
+        qx = make_single_tensor_for_rerank(qimg_r, mean, std, to_rgb=to_rgb).to(DEVICE, non_blocking=True)
+        q_fm = extract_featmap(model, qx, FEAT_LEVEL)
+        q_desc, q_xy = select_query_patches(q_fm)
+        q_desc_list_full.append(q_desc)
+        q_xy_list_full.append(q_xy)
+
+    _q_full_cache[qimg_key] = (q_desc_list_full, q_xy_list_full)
+    return _q_full_cache[qimg_key]
 
 # ============================================================
-# Main
+# Qt API
 # ============================================================
-def main():
-    ensure_dir(OUT_DIR)
+def run_retrieval(query_path: str, out_dir: str, topk: int = TOPK_DEFAULT):
+    """
+    For Qt GUI:
+      return (result_grid_path, top_items)
+      top_items: [{"path": str, "score": float, "geom": float, "id": int}, ...]
+    """
+    ensure_dir(out_dir)
+    g_index, p_index, img_paths, patch_meta, model, mean, std, to_rgb = get_ctx(force_reload=force_reload_flag)
 
-    # Load FAISS
-    g_index = faiss.read_index(GLOBAL_INDEX)
-    p_index = faiss.read_index(PATCH_INDEX)
-    set_faiss_nprobe(g_index, 64)
-    set_faiss_nprobe(p_index, 64)
-
-    img_paths = np.load(GLOBAL_META, allow_pickle=True)
-    patch_meta = np.load(PATCH_META, allow_pickle=True)
-
-    # Build model
-    model, mean, std, to_rgb = build_model(CONFIG, CKPT)
-
-    # Read query
-    qimg = imread_unicode(QUERY_IMG)
+    qimg = imread_unicode(query_path)
+    qimg = crop_by_feat_energy_qt_safe(
+        model, qimg, mean, std, to_rgb,
+        prefer_level=FEAT_LEVEL
+    )
 
     if qimg is None:
-        raise FileNotFoundError(f"Query image not found: {QUERY_IMG}")
-    qimg = crop_by_feat_energy(
-        model, qimg, mean, std, to_rgb,
-        prefer_level=FEAT_LEVEL,
-        input_size=RMAC_INPUT_SIZE,
-        top_frac=0.20,
-        border_frac=0.06,
-        min_area_frac=0.15,
-        pad_px=18,
-        morph_ks=11
-    )
+        raise FileNotFoundError(f"Query image not found: {query_path}")
+
     # -------- Global search
-    qvec = get_query_global_feat(model, mean, std, to_rgb, qimg)  # (1,D)
+    qvec = get_query_global_feat(model, mean, std, to_rgb, qimg)
     _, gids = g_index.search(qvec, TOPG)
     global_rank = clean_rank(gids[0].tolist())
 
     # -------- Patch search
-    q_patch_vecs, n_qpatch = get_query_patch_feats(
+    q_patch_vecs, _ = get_query_patch_feats(
         model, mean, std, to_rgb, qimg,
         patch_sizes=(256, 384, 512),
         stride_ratio=0.5,
-        max_patches=64,      # you can lower to 32 if you want more speed
+        max_patches=64,
         long_edge=1024,
         batch_size=64
     )
-    print(f"[PATCH] query patches={n_qpatch}, vecs={q_patch_vecs.shape}")
 
-    D, I = p_index.search(q_patch_vecs, PATCH_TOPK_PER_QPATCH)  # (P,K)
+    D, I = p_index.search(q_patch_vecs, PATCH_TOPK_PER_QPATCH)
     D = D.astype(np.float32)
 
     patch_ids_all = I.reshape(-1).tolist()
@@ -911,8 +936,7 @@ def main():
     for k, v in rrf_p.items():
         final_rrf[k] = final_rrf.get(k, 0.0) + w_p * v
 
-    # -------- Precompute query patch descriptors (two stages)
-    # FAST (0° only)
+    # -------- Precompute query patch descriptors (FAST 0° only)
     q_desc_list_fast, q_xy_list_fast = [], []
     for ang in ROT_FAST:
         qimg_r = rotate_bgr(qimg, ang)
@@ -921,16 +945,6 @@ def main():
         q_desc, q_xy = select_query_patches(q_fm)
         q_desc_list_fast.append(q_desc)
         q_xy_list_fast.append(q_xy)
-
-    # FULL (±15/±30)
-    q_desc_list_full, q_xy_list_full = [], []
-    for ang in ROT_FULL:
-        qimg_r = rotate_bgr(qimg, ang)
-        qx = make_single_tensor_for_rerank(qimg_r, mean, std, to_rgb=to_rgb).to(DEVICE, non_blocking=True)
-        q_fm = extract_featmap(model, qx, FEAT_LEVEL)
-        q_desc, q_xy = select_query_patches(q_fm)
-        q_desc_list_full.append(q_desc)
-        q_xy_list_full.append(q_xy)
 
     # -------- Candidate rerank (BATCH featmap forward)
     scored: List[Tuple[int, float]] = []
@@ -942,7 +956,8 @@ def main():
         batch_imgs = []
         real_ids = []
         for img_id in batch_ids:
-            cimg = imread_unicode(img_paths[img_id])
+            p = str(img_paths[img_id])
+            cimg = imread_unicode(p)
             if cimg is None:
                 continue
             batch_imgs.append(cimg)
@@ -952,7 +967,7 @@ def main():
             continue
 
         cx = make_batch_tensor_for_rerank(batch_imgs, mean, std, to_rgb=to_rgb).to(DEVICE, non_blocking=True)
-        c_fm_b = extract_featmap(model, cx, FEAT_LEVEL)  # (B,C,Hf,Wf) float32
+        c_fm_b = extract_featmap(model, cx, FEAT_LEVEL)
 
         for bi, img_id in enumerate(real_ids):
             c_fm = c_fm_b[bi:bi + 1]
@@ -974,8 +989,11 @@ def main():
                 if s0 > geom_best:
                     geom_best = s0
 
-            # Stage 2: Only hard cases
+            # Stage 2: Only hard cases -> FULL rotations (cached)
             if geom_best < ROT_TRIGGER:
+                q_desc_list_full, q_xy_list_full = get_full_rot_query_desc(
+                    model, mean, std, to_rgb, qimg, qimg_key=query_path
+                )
                 for q_desc, q_xy in zip(q_desc_list_full, q_xy_list_full):
                     s = geom_score_compatible(
                         q_desc, q_xy, c_desc, c_xy,
@@ -1003,10 +1021,9 @@ def main():
     def norm_g(g):
         return (g - gmin) / (gmax - gmin + 1e-9)
 
-    beta = 0.3
     final = []
     for img_id, gs in scored:
-        fs = final_rrf.get(img_id, 0.0) * (1.0 + beta * norm_g(gs))
+        fs = final_rrf.get(img_id, 0.0) * (1.0 + BETA_GEOM * norm_g(gs))
         final.append((img_id, fs, gs))
     final.sort(key=lambda x: x[1], reverse=True)
 
@@ -1017,22 +1034,37 @@ def main():
     final_norm = [(img_id, (fs - s_min) / (s_max - s_min), gs) for img_id, fs, gs in final]
     final_norm.sort(key=lambda x: x[1], reverse=True)
 
-    top = final_norm[:TOPK]
+    top = final_norm[:int(topk)]
 
-    print("\nTop results:")
-    for r, (img_id, fs, gs) in enumerate(top, 1):
-        print(f"{r:02d}  final={fs:.4f}  geom={gs:.4f}  {img_paths[img_id]}")
+    top_items = []
+    for img_id, fs, gs in top:
+        top_items.append({
+            "path": str(img_paths[img_id]),
+            "score": float(fs),
+            "geom": float(gs),
+            "id": int(img_id),
+        })
 
-    # -------- Visualize
+    # ---- output grid
     imgs, scs = [], []
-    for img_id, fs, _ in top:
-        imgs.append(imread_unicode(img_paths[img_id]))
-        scs.append(fs)
+    for it in top_items:
+        imgs.append(imread_unicode(it["path"]))
+        scs.append(it["score"])
 
-    out = os.path.join(OUT_DIR, "result_grid.png")
-    visualize_grid(qimg, imgs, scs, out, tile=320)
-    print("Saved:", out)
+    result_grid_path = os.path.join(out_dir, "result_grid.png")
+    visualize_grid(qimg, imgs, scs, result_grid_path, tile=320)
 
+    return result_grid_path, top_items
 
+# ============================================================
+# Optional CLI test
+# ============================================================
 if __name__ == "__main__":
-    main()
+    # Example manual test (edit your query/out_dir):
+    query = r"D:\zhanlan\search_vis\q_1770274344_crop_raw.png"
+
+    out_dir = r"D:\zhanlan\search_vis"
+    grid_path, items = run_retrieval(query, out_dir, topk=12)
+    print("Saved:", grid_path)
+    for i, it in enumerate(items, 1):
+        print(i, it["score"], it["geom"], it["path"])

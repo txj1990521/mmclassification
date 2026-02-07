@@ -11,7 +11,6 @@ Outputs:
 
 - PATCH_INDEX:   patch index file
 - PATCH_META:    patch meta array (patch_id -> {img_id,bbox,win})
-- PATCH_IMG_PATHS: same as GLOBAL_META (share img_id->path)
 
 Notes:
 - For small datasets (<20k images / <200k patches) it will fall back to FlatIP.
@@ -34,6 +33,14 @@ from typing import List, Tuple
 from mmengine.config import Config
 from mmengine.runner import load_checkpoint
 from mmpretrain.registry import MODELS
+from hybrid_shared import (
+    STRIPE_AR_THR, STRIPE_LONG_EDGE,
+    STRIPE_WIN_H, STRIPE_STRIDE, STRIPE_MAX_PATCHES,
+    STRIPE_CENTER_FRAC, STRIPE_JITTER,
+    PATCH_SIZES, STRIDE_RATIO, MAX_LONG, MAX_PATCHES_PER_IMAGE,
+    resize_long_edge, seed_from_image,
+    gen_patch_windows_unified, patch_to_model_input,
+)
 
 # =========================
 # CONFIG: 只改这里
@@ -48,9 +55,15 @@ OUT_DIR = r"D:\zhanlan\faiss_database_hybrid_new_data"
 GLOBAL_INDEX = os.path.join(OUT_DIR, "global.index")
 GLOBAL_META  = os.path.join(OUT_DIR, "global_img_paths.npy")
 
-PATCH_INDEX  = os.path.join(OUT_DIR, "patch.index")
-PATCH_META   = os.path.join(OUT_DIR, "patch_meta.npy")
-PATCH_IMG_PATHS = os.path.join(OUT_DIR, "patch_img_paths.npy")
+
+
+
+PATCH_STRIPE_INDEX = os.path.join(OUT_DIR, "patch_stripe.index")
+PATCH_GRID_INDEX   = os.path.join(OUT_DIR, "patch_grid.index")
+
+PATCH_STRIPE_META  = os.path.join(OUT_DIR, "patch_stripe_meta.npy")
+PATCH_GRID_META    = os.path.join(OUT_DIR, "patch_grid_meta.npy")
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -70,17 +83,22 @@ VIEW_PLAN = [
 ]
 VIEW_BATCH = 256  # batch in "views"
 
+
+# =========================
+# STRIPE_SHARED_CONSTANTS
+# =========================
+
+STRIPE_WIN_W_FRAC = 0.85
+STRIPE_WIN_W_MIN = 160
+STRIPE_WIN_W_MAX = 256
+
+
 # =========================
 # Patch tiling config (stable, not scene-specific)
 # =========================
-MAX_LONG = 1536
-PATCH_SIZES = (256, 384, 512, 768)
-STRIDE_RATIO = 0.5
 
 # Cap patches per image to control explosion (still generic)
 # If too many windows, we sample deterministically.
-MAX_PATCHES_PER_IMAGE = 60
-
 # Patch encoding: we will center-crop/resize each patch to 224 before model
 PATCH_ENC_SIZE = 224
 
@@ -297,13 +315,7 @@ def gen_stripe_windows(
 
     return windows
 
-def resize_long_edge(img_bgr: np.ndarray, max_long: int):
-    h, w = img_bgr.shape[:2]
-    s = max_long / max(h, w)
-    if s >= 1.0:
-        return img_bgr
-    nh, nw = int(round(h*s)), int(round(w*s))
-    return cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
 
 def sample_windows_deterministic(windows: List[Tuple[int,int,int,int,int,int,int]], k: int, seed: int):
     """Deterministically sample k windows from list."""
@@ -336,7 +348,7 @@ def gen_patch_windows(img_bgr: np.ndarray,
 
     # 判定条形（和 query 一致的思路）
     ar = max(W / (H + 1e-6), H / (W + 1e-6))
-    is_stripe = (ar >= 3.0)
+    is_stripe = (ar >= STRIPE_AR_THR)
 
     windows = []
 
@@ -344,19 +356,21 @@ def gen_patch_windows(img_bgr: np.ndarray,
         # ---- 条形滑窗 ----
         # 这些参数建议与你 query 侧保持一致（你 get_query_patch_feats 用的）
         # 可以按数据再调，但先用这套稳态默认
-        win_w = min(192, W)  # 条带厚度方向
-        win_h = 384          # 沿长边长度
-        stride = max(32, win_h // 4)
+        # unified stripe params (library side)
+        win_h = 224  # length along stripe
+        stride = 48  # dense sliding
+        max_patches = 24  # stable cap
 
+        win_w = int(np.clip(STRIPE_WIN_W_FRAC * W, STRIPE_WIN_W_MIN, STRIPE_WIN_W_MAX))
         windows = gen_stripe_windows(
             H, W,
-            max_patches=max_patches,
+            max_patches=STRIPE_MAX_PATCHES,
             seed=seed,
             win_w=win_w,
-            win_h=min(win_h, max(H, W)),
-            stride=stride,
-            center_frac=0.92,
-            jitter=8,
+            win_h=STRIPE_WIN_H,
+            stride=STRIPE_STRIDE,
+            center_frac=STRIPE_CENTER_FRAC,
+            jitter=STRIPE_JITTER,
         )
 
         # 如果窗太少，补一个中心大窗（兜底）
@@ -395,13 +409,6 @@ def gen_patch_windows(img_bgr: np.ndarray,
 
     return img, windows
 
-def patch_to_model_input(patch_bgr: np.ndarray, mean, std, to_rgb: bool, out_size=224):
-    if to_rgb:
-        patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
-    else:
-        patch_rgb = patch_bgr[:, :, ::-1].copy()
-    patch_rgb = cv2.resize(patch_rgb, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
-    return to_tensor_from_rgb(patch_rgb, mean, std)
 
 # =========================
 # model
@@ -519,7 +526,8 @@ def build_ivfpq_ip(feats: np.ndarray, seed: int, m: int = PQ_M, nbits: int = PQ_
 def main():
     print("[INFO] device:", DEVICE)
     ensure_dir(GLOBAL_INDEX)
-    ensure_dir(PATCH_INDEX)
+    ensure_dir(PATCH_STRIPE_INDEX)
+    ensure_dir(PATCH_GRID_INDEX)
 
     model, mean, std, to_rgb = build_model(CONFIG, CKPT, DEVICE)
 
@@ -563,30 +571,21 @@ def main():
 
     # ---------- Build PATCH feats (streaming) ----------
     # We'll collect in chunks too; for huge sets you may want memmap, but this is a complete baseline.
-    patch_feats_chunks = []
-    patch_meta_list = []  # (img_id,x1,y1,x2,y2,win,ptype,pos) in resized coords
-    total_patches = 0
+    # stripe
+    patch_buf_tensors_s = []
+    patch_buf_meta_s = []
+    patch_feats_chunks_s = []
+    patch_meta_list_s = []
 
+    # grid
+    patch_buf_tensors_g = []
+    patch_buf_meta_g = []
+    patch_feats_chunks_g = []
+    patch_meta_list_g = []
+
+    # Patch streaming buffers
     # For patch encoding we use smaller batches to fit GPU
     PATCH_BATCH = 256
-
-    # We need img_id mapping
-    img_id_map = {}  # path -> img_id
-
-    for i, p in enumerate(paths, 1):
-        img = imread_unicode(str(p))
-        if img is None:
-            continue
-
-        # assign img_id
-        img_id = len(img_paths) + len(img_batch_paths)  # current future index within img_paths
-        # NOTE: Because img_paths is appended in flush, img_id based on this is tricky.
-        # We'll instead assign img_id by a separate counter for correctness:
-        # So let's use an independent counter:
-        # (We'll fix by using a separate list and append immediately)
-        # ----
-        # We'll handle it by maintaining a definitive list img_paths_all.
-        # ----
 
     # Re-scan with definitive img_id list to keep code simple and correct.
     img_paths_all = []
@@ -608,21 +607,27 @@ def main():
     img_batch_paths = []
     img_batch_views = []
 
-    # Patch streaming buffers
-    patch_buf_tensors = []
-    patch_buf_meta = []
-
-    def flush_patch_batch():
-        nonlocal patch_buf_tensors, patch_buf_meta, patch_feats_chunks, patch_meta_list, total_patches
-        if not patch_buf_tensors:
+    def flush_patch_batch_stripe():
+        nonlocal patch_buf_tensors_s, patch_buf_meta_s
+        if not patch_buf_tensors_s:
             return
-        bt = torch.stack(patch_buf_tensors, dim=0).to(DEVICE)
+        bt = torch.stack(patch_buf_tensors_s).to(DEVICE)
         feats = extract_backbone_last(model, bt).cpu().numpy().astype("float32")
-        patch_feats_chunks.append(feats)
-        patch_meta_list.extend(patch_buf_meta)
-        total_patches += feats.shape[0]
-        patch_buf_tensors = []
-        patch_buf_meta = []
+        patch_feats_chunks_s.append(feats)
+        patch_meta_list_s.extend(patch_buf_meta_s)
+        patch_buf_tensors_s.clear()
+        patch_buf_meta_s.clear()
+
+    def flush_patch_batch_grid():
+        nonlocal patch_buf_tensors_g, patch_buf_meta_g
+        if not patch_buf_tensors_g:
+            return
+        bt = torch.stack(patch_buf_tensors_g).to(DEVICE)
+        feats = extract_backbone_last(model, bt).cpu().numpy().astype("float32")
+        patch_feats_chunks_g.append(feats)
+        patch_meta_list_g.extend(patch_buf_meta_g)
+        patch_buf_tensors_g.clear()
+        patch_buf_meta_g.clear()
 
     for idx, (img_id, path) in enumerate(valid_images, 1):
         img = imread_unicode(path)
@@ -630,8 +635,13 @@ def main():
             continue
 
         # ---- GLOBAL ----
-        random.seed(seed_from_path(path, base=0))
-        views = make_views_for_global(img, mean, std, to_rgb=to_rgb)
+        # 统一做 seed 的源图
+        seed_src = resize_long_edge(img, max_long=STRIPE_LONG_EDGE)
+        random.seed(seed_from_image(seed_src, base=0))
+
+        # views 用同一个 seed_src（或者至少同一份 resize 结果）
+        views = make_views_for_global(seed_src, mean, std, to_rgb)
+
         if len(views) > 0:
             img_batch_paths.append(path)
             img_batch_views.append(views)
@@ -640,30 +650,47 @@ def main():
 
         # ---- PATCH ----
         # Deterministic seed per image (for window sampling)
-        s_patch = seed_from_path(path, base=999)
-        img_resized, windows = gen_patch_windows(
+        img_resized_tmp = resize_long_edge(img, max_long=MAX_LONG)
+        s_patch = seed_from_image(img_resized_tmp, base=999)
+        img_resized, windows, is_stripe = gen_patch_windows_unified(
             img,
-            sizes=PATCH_SIZES,
-            stride_ratio=STRIDE_RATIO,
             max_long=MAX_LONG,
+            stripe_ar_thr=STRIPE_AR_THR,
+            seed_base=999,
+            stripe_max_patches=STRIPE_MAX_PATCHES,
+            stripe_win_h=STRIPE_WIN_H,
+            stripe_stride=STRIPE_STRIDE,
+            stripe_center_frac=STRIPE_CENTER_FRAC,
+            stripe_jitter=STRIPE_JITTER,
+            grid_sizes=PATCH_SIZES,
+            grid_stride_ratio=STRIDE_RATIO,
             max_patches=MAX_PATCHES_PER_IMAGE,
-            seed=s_patch,
         )
 
         for (x1, y1, x2, y2, win, ptype, pos) in windows:
             patch = img_resized[y1:y2, x1:x2]
-            t = patch_to_model_input(patch, mean, std, to_rgb=to_rgb, out_size=PATCH_ENC_SIZE)
-            patch_buf_tensors.append(t)
-            patch_buf_meta.append((img_id, x1, y1, x2, y2, win, ptype, pos))
+            t = patch_to_model_input(patch, mean, std, to_rgb, PATCH_ENC_SIZE)
 
-            if len(patch_buf_tensors) >= PATCH_BATCH:
-                flush_patch_batch()
+            if ptype == 1:  # stripe
+                patch_buf_tensors_s.append(t)
+                patch_buf_meta_s.append((img_id, x1, y1, x2, y2, win, ptype, pos))
+                if len(patch_buf_tensors_s) >= PATCH_BATCH:
+                    flush_patch_batch_stripe()
+            else:  # grid
+                patch_buf_tensors_g.append(t)
+                patch_buf_meta_g.append((img_id, x1, y1, x2, y2, win, ptype, pos))
+                if len(patch_buf_tensors_g) >= PATCH_BATCH:
+                    flush_patch_batch_grid()
 
         if idx % 500 == 0:
-            print(f"[SCAN] {idx}/{len(valid_images)}  global_kept={len(img_paths)+len(img_batch_paths)}  patches={total_patches + len(patch_buf_tensors)}")
+            ps = sum(x.shape[0] for x in patch_feats_chunks_s) + len(patch_buf_tensors_s)
+            pg = sum(x.shape[0] for x in patch_feats_chunks_g) + len(patch_buf_tensors_g)
+            print(
+                f"[SCAN] {idx}/{len(valid_images)} global_kept={len(img_paths) + len(img_batch_paths)}  stripe={ps} grid={pg}")
 
     flush_global_batch()
-    flush_patch_batch()
+    flush_patch_batch_stripe()
+    flush_patch_batch_grid()
 
     # Finalize global feats
     if not global_feats_chunks:
@@ -696,17 +723,30 @@ def main():
     img_paths_compact = np.array(keep_paths, dtype=object)
 
     # Filter patch meta to only kept images, and remap img_id
-    patch_feats = np.concatenate(patch_feats_chunks, axis=0).astype("float32")
-    patch_meta = np.array(patch_meta_list, dtype=np.int32)  # shape (Npatch,8)
+    patch_feats_s = np.concatenate(patch_feats_chunks_s, axis=0) if patch_feats_chunks_s else np.zeros(
+        (0, global_feats2.shape[1]), np.float32)
+    patch_meta_s = np.array(patch_meta_list_s, dtype=np.int32) if patch_meta_list_s else np.zeros((0, 8), np.int32)
 
-    keep_mask = np.array([m[0] in oldid_to_newid for m in patch_meta_list], dtype=bool)
-    patch_feats = patch_feats[keep_mask]
-    patch_meta = patch_meta[keep_mask]
-    patch_meta[:, 0] = np.array([oldid_to_newid[int(x)] for x in patch_meta[:, 0]], dtype=np.int32)
+    patch_feats_g = np.concatenate(patch_feats_chunks_g, axis=0) if patch_feats_chunks_g else np.zeros(
+        (0, global_feats2.shape[1]), np.float32)
+    patch_meta_g = np.array(patch_meta_list_g, dtype=np.int32) if patch_meta_list_g else np.zeros((0, 8), np.int32)
 
-    print(f"[DONE] Global feats: {global_feats2.shape}, Patch feats: {patch_feats.shape}")
+    # stripe
+    keep_mask_s = np.array([m[0] in oldid_to_newid for m in patch_meta_s], dtype=bool)
+    patch_feats_s = patch_feats_s[keep_mask_s]
+    patch_meta_s = patch_meta_s[keep_mask_s]
+    patch_meta_s[:, 0] = np.array([oldid_to_newid[int(x)] for x in patch_meta_s[:, 0]], dtype=np.int32)
+
+    # grid
+    keep_mask_g = np.array([m[0] in oldid_to_newid for m in patch_meta_g], dtype=bool)
+    patch_feats_g = patch_feats_g[keep_mask_g]
+    patch_meta_g = patch_meta_g[keep_mask_g]
+    patch_meta_g[:, 0] = np.array([oldid_to_newid[int(x)] for x in patch_meta_g[:, 0]], dtype=np.int32)
+
+    print(f"[DONE] Global feats: {global_feats2.shape}, Patch stripe feats: {patch_feats_s.shape},Patch grid feats: {patch_feats_g.shape}")
     Nimg, D = global_feats2.shape
-    Npatch = patch_feats.shape[0]
+    D = int(global_feats2.shape[1])
+    # 或者 assert patch_feats_s.shape[1] == D
 
     # ---------- Build GLOBAL index ----------
     if Nimg < GLOBAL_FLAT_THRESHOLD:
@@ -717,27 +757,33 @@ def main():
         g_index = build_ivfflat_ip(global_feats2, seed=IVF_SEED)
 
     # ---------- Build PATCH index ----------
-    if Npatch < PATCH_FLAT_THRESHOLD_VECS:
-        print(f"[PATCH] Small set ({Npatch}), using FlatIP")
-        p_index = faiss.IndexFlatIP(D)
-        p_index.add(patch_feats)
+    # stripe index
+    if len(patch_feats_s) < PATCH_FLAT_THRESHOLD_VECS:
+        p_index_s = faiss.IndexFlatIP(D)
+        p_index_s.add(patch_feats_s)
     else:
-        # IVF-PQ is recommended for large patch sets
-        p_index = build_ivfpq_ip(patch_feats, seed=IVF_SEED, m=PQ_M, nbits=PQ_NBITS)
+        p_index_s = build_ivfpq_ip(patch_feats_s, seed=IVF_SEED)
+
+    # grid index
+    if len(patch_feats_g) < PATCH_FLAT_THRESHOLD_VECS:
+        p_index_g = faiss.IndexFlatIP(D)
+        p_index_g.add(patch_feats_g)
+    else:
+        p_index_g = build_ivfpq_ip(patch_feats_g, seed=IVF_SEED)
 
     # Save
     faiss.write_index(g_index, GLOBAL_INDEX)
     np.save(GLOBAL_META, img_paths_compact, allow_pickle=True)
 
-    faiss.write_index(p_index, PATCH_INDEX)
-    np.save(PATCH_IMG_PATHS, img_paths_compact, allow_pickle=True)
-    np.save(PATCH_META, patch_meta, allow_pickle=True)
+    faiss.write_index(p_index_s, PATCH_STRIPE_INDEX)
+    np.save(PATCH_STRIPE_META, patch_meta_s, allow_pickle=True)
+
+    faiss.write_index(p_index_g, PATCH_GRID_INDEX)
+    np.save(PATCH_GRID_META, patch_meta_g, allow_pickle=True)
+
 
     print(f"[SAVE] Global index -> {GLOBAL_INDEX}")
     print(f"[SAVE] Global paths -> {GLOBAL_META}")
-    print(f"[SAVE] Patch index  -> {PATCH_INDEX}")
-    print(f"[SAVE] Patch meta   -> {PATCH_META}")
-    print(f"[SAVE] Patch paths  -> {PATCH_IMG_PATHS}")
     print("[OK] Hybrid build finished.")
 
 if __name__ == "__main__":
