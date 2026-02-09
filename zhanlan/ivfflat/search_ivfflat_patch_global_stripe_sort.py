@@ -32,7 +32,7 @@ from mmpretrain.registry import MODELS
 from rembg import remove, new_session
 from pycocotools import mask as maskUtils
 from ultralytics import YOLO
-from hybrid_shared import gen_patch_windows_unified, patch_to_model_input, STRIPE_LONG_EDGE
+from .hybrid_shared import gen_patch_windows_unified, patch_to_model_input, STRIPE_LONG_EDGE
 # mp
 mp.set_start_method("spawn", force=True)
 
