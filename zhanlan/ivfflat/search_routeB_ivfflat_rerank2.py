@@ -37,7 +37,7 @@ TOPM = 6
 CONFIG = r"D:\zhanlanProject\mmpretrain\zhanlan\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan.py"
 CKPT   = r"D:\zhanlanProject\mmpretrain\work_dirs\simclr_resnet50_8xb32-coslr-200e_in1k_zhanlan\epoch_200.pth"
 
-QUERY_IMG = r"D:\zhanlan\qurrey_data\20260127160225_24_7.jpg"
+QUERY_IMG = r"D:\zhanlan\qurrey_data\444.jpg"
 
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid"
