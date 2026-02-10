@@ -25,14 +25,19 @@ import torch
 import torch.nn.functional as F
 import hashlib
 import random
+import os
 from matplotlib import pyplot as plt
 from mmengine.config import Config
 from mmengine.runner import load_checkpoint
 from mmpretrain.registry import MODELS
 from rembg import remove, new_session
 from pycocotools import mask as maskUtils
+from torch.cuda.amp import autocast
 from ultralytics import YOLO
 from hybrid_shared import gen_patch_windows_unified, patch_to_model_input, STRIPE_LONG_EDGE
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")  # PyTorch 2.x 对 matmul 更快
+
 # mp
 mp.set_start_method("spawn", force=True)
 
@@ -57,7 +62,7 @@ YOLO_SEG_WEIGHTS = r"D:\zhanlanProject\ultralyticsV8\runs\huaxing\exp12\weights\
 _YOLO_SEG = None
 
 # ---------- query / index ----------
-QUERY_IMG = r"D:\zhanlan\qurrey_data\444.JPG"
+QUERY_IMG = r"D:\zhanlan\segment_data\花色随机拍摄照片\IMG_20260129_114047(1).jpg"
 
 INDEX_DIR = r"D:\zhanlan\faiss_database_hybrid_new_data"
 GLOBAL_INDEX = os.path.join(INDEX_DIR, "global.index")
@@ -738,7 +743,9 @@ def make_views_for_global(img_bgr: np.ndarray, mean, std, to_rgb: bool):
 @torch.no_grad()
 def aggregate_views_to_one(feats_view: torch.Tensor):
     # You used max pooling; keep consistent with your system.
-    agg = feats_view.max(dim=0).values
+    # agg = feats_view.max(dim=0).values
+    agg = feats_view.mean(dim=0)
+
     agg = power_norm_torch(agg)
     agg = F.normalize(agg.unsqueeze(0), p=2, dim=1).squeeze(0)
     return agg
@@ -818,18 +825,21 @@ def batch_candidate_desc_xy(model, img_ids, img_cache, img_paths, mean, std, to_
 
         if len(buf_ids) >= batch_size:
             bt = torch.cat(buf_tensors, dim=0).to(device, non_blocking=True)  # (B,3,512,512)
-            fm = extract_featmap(model, bt, feat_level)                       # (B,C,H,W)
+            with autocast(enabled=(DEVICE.startswith("cuda"))):
+                fm = extract_featmap(model, bt, feat_level)                       # (B,C,H,W)
             for i, _id in enumerate(buf_ids):
-                d, x = select_candidate_patches(fm[i:i+1])
-                out[_id] = (d, x)
+                d, x = select_candidate_patches(fm[i:i + 1])
+                out[_id] = (d.float(), x.float())
+
             buf_ids, buf_tensors = [], []
 
     if buf_ids:
         bt = torch.cat(buf_tensors, dim=0).to(device, non_blocking=True)
-        fm = extract_featmap(model, bt, feat_level)
+        with autocast(enabled=(DEVICE.startswith("cuda"))):
+            fm = extract_featmap(model, bt, feat_level)
         for i, _id in enumerate(buf_ids):
-            d, x = select_candidate_patches(fm[i:i+1])
-            out[_id] = (d, x)
+            d, x = select_candidate_patches(fm[i:i + 1])
+            out[_id] = (d.float(), x.float())
 
     return out
 
@@ -976,6 +986,9 @@ def select_candidate_patches(c_fm_1bchw: torch.Tensor,
     d, x = select_top_patches_with_xy(c_fm_1bchw, keep=keep, border=border, roi_fbox=c_roi)
     return d, x
 
+def sync():
+    if DEVICE.startswith("cuda"):
+        torch.cuda.synchronize()
 
 # ============================================================
 # 8. Patch Extraction for FAISS Patch Index Query
@@ -1698,17 +1711,18 @@ def main():
 
     img_paths = np.load(GLOBAL_META, allow_pickle=True)
 
-    target_path = r"...\IMG_8830(1)_label0_score0.999.png"  # 你认为在库里的那张
-    # 在 img_paths 里找它的 img_id
-    import os
-    base = os.path.basename(target_path)
-    hits = [i for i, p in enumerate(img_paths) if os.path.basename(str(p)) == base]
-    print("target hits:", hits[:10], "count=", len(hits))
+    # target_path = r"...\IMG_8830(1)_label0_score0.999.png"  # 你认为在库里的那张
+    # # 在 img_paths 里找它的 img_id
+    #
+    # base = os.path.basename(target_path)
+    # hits = [i for i, p in enumerate(img_paths) if os.path.basename(str(p)) == base]
+    # print("target hits:", hits[:10], "count=", len(hits))
 
     patch_meta_s = np.load(PATCH_STRIPE_META, allow_pickle=True)
     patch_meta_g = np.load(PATCH_GRID_META, allow_pickle=True)
 
     model, mean, std, to_rgb = build_model(CONFIG, CKPT)
+
 
     # ---- load query
     qimg0 = imread_unicode(QUERY_IMG)
@@ -1735,6 +1749,8 @@ def main():
 
     # ---- global feature
     qvec = get_query_global_feat(model, mean, std, to_rgb, qimg)
+
+
     q_patch_vecs, n_qpatch, is_stripe2, hw = get_query_patch_feats_unified(
         model, mean, std, to_rgb, qimg,
         qmask=qmask,
@@ -1746,6 +1762,7 @@ def main():
         min_mask_cover=0.0,
         batch_size=64
     )
+
     is_vertical_stripe = is_stripe2
     print(f"[PATCH] is_stripe={is_stripe2}, resized={hw}, n={n_qpatch}")
 
@@ -1772,6 +1789,7 @@ def main():
             top_images=TOP_PATCH_IMAGES,
             tau=0.15
         )
+
     # ---- RRF fusion
     rrf_g = rank_to_rrf_score(global_rank, k=RRF_K)
     rrf_p = rank_to_rrf_score(patch_rank,  k=RRF_K)
@@ -1836,8 +1854,6 @@ def main():
         final_rrf[k] = final_rrf.get(k, 0.0) + w_p * v
 
     # ---- candidate pool
-    # ---- candidate pool (Fix: use weighted final_rrf to rank candidates) ----
-    # final_rrf 已经在上面算好了：final_rrf[img_id] = w_g*rrf_g + w_p*rrf_p
 
     # 1) 先拿一个“候选集合”（用原 fused 只是为了召回，不用它的排序）
     cand = clean_rank(rrf_fuse(global_rank, patch_rank, RRF_K))
@@ -1859,37 +1875,45 @@ def main():
             fused2.append(img_id)
             cimg_cache[img_id] = cimg
 
-    target_id = hits[0]
+
 
     def rank_pos(lst, x):
         try:
             return lst.index(x) + 1
         except:
             return None
-
-    print("target global pos:", rank_pos(global_rank, target_id))
-    print("target patch  pos:", rank_pos(patch_rank, target_id))
-    print("target fused  pos:", rank_pos(fused, target_id))
-    print("target fused2 pos:", rank_pos(fused2, target_id))  # fused2 是 gate 后的
-    print("target fused(pos after weighted):", rank_pos(fused, target_id))
+    # target_id = hits[0]
+    # print("target global pos:", rank_pos(global_rank, target_id))
+    # print("target patch  pos:", rank_pos(patch_rank, target_id))
+    # print("target fused  pos:", rank_pos(fused, target_id))
+    # print("target fused2 pos:", rank_pos(fused2, target_id))  # fused2 是 gate 后的
+    # print("target fused(pos after weighted):", rank_pos(fused, target_id))
 
     # ---- geom rerank
     angles = [-10, -5, 0, 5, 10] if is_vertical_stripe else [-30, -15, 0, 15, 30]
+
+    # query 侧还是按角度算（数量小，问题不大）
     q_desc_list, q_xy_list = [], []
     for ang in angles:
         qimg_r = rotate_bgr(qimg, ang)
         qx = make_single_tensor_for_rerank(qimg_r, mean, std, to_rgb).to(DEVICE)
         q_fm = extract_featmap(model, qx, FEAT_LEVEL)
         q_desc, q_xy = select_query_patches(q_fm)
-        q_desc_list.append(q_desc)
-        q_xy_list.append(q_xy)
+        q_desc_list.append(q_desc.float())
+        q_xy_list.append(q_xy.float())
+
+    # 候选图：一次 batch forward，拿到每张图的 (c_desc, c_xy)
+    cand_desc_xy = batch_candidate_desc_xy(
+        model, fused2, cimg_cache, img_paths, mean, std, to_rgb,
+        device=DEVICE, batch_size=32, feat_level=FEAT_LEVEL
+    )
+
 
     scored = []
     for img_id in fused2:
-        cimg = cimg_cache[img_id]
-        cx = make_single_tensor_for_rerank(cimg, mean, std, to_rgb).to(DEVICE)
-        c_fm = extract_featmap(model, cx, FEAT_LEVEL)
-        c_desc, c_xy = select_candidate_patches(c_fm)
+        if img_id not in cand_desc_xy:
+            continue
+        c_desc, c_xy = cand_desc_xy[img_id]
 
         geom_best, cnt = 0.0, 0
         for q_desc, q_xy in zip(q_desc_list, q_xy_list):
@@ -1905,9 +1929,6 @@ def main():
             if s > 0:
                 geom_best += s
                 cnt += 1
-            if img_id == 351:
-                print("[T351] cnt=", cnt, "geom_best=", geom_best, "avg=", (geom_best / cnt if cnt > 0 else 0.0))
-
         if cnt > 0:
             scored.append((img_id, geom_best / cnt))
 
