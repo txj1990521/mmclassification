@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zhanlan-retrieval"
+version = "0.1.0"
+description = "Zhanlan Hybrid Image Retrieval Pipeline (public API)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Zhanlan" }]
+
+dependencies = [
+  "numpy>=1.21",
+  "opencv-python>=4.6",
+  "torch>=1.13",
+  "mmengine>=0.8",
+  "mmpretrain>=1.0",
+  "ultralytics>=8.0",
+]
+
+[tool.setuptools]
+# 这里不要再写 packages = { find = {} }
+# 只用下面的 find 配置就够了
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["zhanlan", "zhanlan.*"]
+
+# 可选 CLI：注意这只是入口指向一个“可调用对象”
+# 目前的 ZhanlanRetriever 是类，不是函数；保留会导致命令行不可用
+# [project.scripts]
+# zhanlan-retrieval = "zhanlan.ivfflat.zhanlan_retrieval.cli:main"
