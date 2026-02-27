@@ -21,7 +21,7 @@ OUT_DIR = r"D:\zhanlan\faiss_database_simclr_aligned"
 GLOBAL_INDEX_PATH = os.path.join(OUT_DIR, "simclr_global.index")
 
 # 重要：为了“对齐可用”，输出一个向量id -> img_id 映射
-VEC_TO_IMGID_PATH = os.path.join(OUT_DIR, "g_vec_to_imgid.npy")
+VEC_TO_IMGID_PATH = os.path.join(OUT_DIR, "simclr_vec_to_imgid.npy")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 256
